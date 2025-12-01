@@ -8,6 +8,7 @@ A reusable C++ library for integrating PostHog telemetry into DuckDB extensions.
 - Thread-safe singleton access.
 - Captures `extension_load` and `function_execution` events.
 - Platform-specific metadata (e.g., MAC address for anonymous identification).
+- **Enabled by default**, with support for user opt-out via DuckDB settings (see Integration Guide).
 - Designed to be included as a git submodule.
 
 ## Dependencies

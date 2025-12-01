@@ -69,6 +69,21 @@ void MyExtensionLoad(DuckDB &db) {
     // CRITICAL: Provide the unique name of this extension.
     telemetry.CaptureExtensionLoad("my_unique_extension_name");
 
+    // 4. Register a Configuration Option
+    // Allow users to disable telemetry via SET my_extension_enable_telemetry = false;
+    // This option is mandatory to respect user privacy.
+    auto &config = DBConfig::GetConfig(db);
+    config.AddExtensionOption(
+        "my_extension_enable_telemetry",
+        "Enable or disable anonymous usage telemetry for my_extension",
+        LogicalType::BOOLEAN,
+        Value::BOOLEAN(true),
+        [](ClientContext &context, SetScope scope, Value &parameter) {
+            auto& telemetry = duckdb::PostHogTelemetry::Instance();
+            telemetry.SetEnabled(BooleanValue::Get(parameter));
+        }
+    );
+
     // ... rest of your initialization ...
 }
 ```
@@ -91,14 +106,26 @@ Define the extension name as a constant or macro to avoid typos.
 telemetry.CaptureExtensionLoad(MY_EXTENSION_NAME);
 ```
 
-## 5. Verification
+## 5. Configuring User Settings
+
+Telemetry is **enabled by default** to assist with development and usage tracking. However, you **must** provide a way for users to opt-out.
+
+Use `DBConfig::AddExtensionOption` to register a SET variable (e.g., `my_extension_telemetry_enabled`). The callback function should update the telemetry singleton state.
+
+**User Usage Example (DuckDB Shell):**
+```sql
+-- Disable telemetry for this session
+SET my_extension_enable_telemetry = false;
+```
+
+## 6. Verification
 
 1.  **Build** the extension to ensure linker errors are resolved.
 2.  **Load** the extension in DuckDB.
 3.  **Check** your PostHog dashboard for the `extension_load` event.
 4.  **Verify** the `extension_name` property matches your configuration.
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 *   **Linker Errors**: Ensure `posthog_telemetry` is linked and that the DuckDB environment provides `httplib` and `openssl`.
 *   **Missing Events**: 
