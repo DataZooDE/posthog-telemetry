@@ -1,15 +1,27 @@
 # PostHog Telemetry Unit Tests using Catch2
-# This assumes the library is used as a submodule in a DuckDB extension project
+# Supports both:
+# 1. Standalone build (CI) - DuckDB checked out to ${CMAKE_SOURCE_DIR}/duckdb
+# 2. Submodule in erpl - DuckDB at ${CMAKE_SOURCE_DIR}/duckdb (erpl's root)
 
 find_package(OpenSSL REQUIRED)
 
-# Include directories - these paths work when used as submodule in erpl
+# Find DuckDB headers - try multiple locations
+if(EXISTS "${CMAKE_SOURCE_DIR}/duckdb/third_party/catch")
+    # Both standalone CI and erpl submodule use this path structure
+    set(DUCKDB_THIRD_PARTY "${CMAKE_SOURCE_DIR}/duckdb/third_party")
+    set(DUCKDB_SRC_INCLUDE "${CMAKE_SOURCE_DIR}/duckdb/src/include")
+    message(STATUS "Found DuckDB at ${CMAKE_SOURCE_DIR}/duckdb")
+else()
+    message(FATAL_ERROR "Cannot find DuckDB headers. Please ensure DuckDB is available at ${CMAKE_SOURCE_DIR}/duckdb")
+endif()
+
+# Include directories
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    ${CMAKE_SOURCE_DIR}/duckdb/third_party/catch
-    ${CMAKE_SOURCE_DIR}/duckdb/third_party/httplib
-    ${CMAKE_SOURCE_DIR}/duckdb/third_party
-    ${CMAKE_SOURCE_DIR}/duckdb/src/include
+    ${DUCKDB_THIRD_PARTY}/catch
+    ${DUCKDB_THIRD_PARTY}/httplib
+    ${DUCKDB_THIRD_PARTY}
+    ${DUCKDB_SRC_INCLUDE}
     ${OPENSSL_INCLUDE_DIR}
 )
 

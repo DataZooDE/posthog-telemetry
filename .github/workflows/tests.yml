@@ -1,0 +1,63 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Run Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout posthog-telemetry
+        uses: actions/checkout@v4
+
+      - name: Checkout DuckDB (for headers)
+        uses: actions/checkout@v4
+        with:
+          repository: duckdb/duckdb
+          path: duckdb
+          ref: v1.4.3
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake ninja openssl@3
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B build -G Ninja \
+            -DBUILD_UNITTESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cmake -B build -G Ninja \
+            -DBUILD_UNITTESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Run tests
+        run: ./build/test/cpp/posthog_telemetry_tests --reporter console
+
+      - name: Run tests with verbose output on failure
+        if: failure()
+        run: ./build/test/cpp/posthog_telemetry_tests --reporter console -s
