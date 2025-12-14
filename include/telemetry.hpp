@@ -81,7 +81,7 @@ private:
                     continue;
                 }
             }
-            
+
             try {
                 item.task(item.data);
             } catch (...) {
@@ -105,12 +105,17 @@ public:
     PostHogTelemetry(const PostHogTelemetry&) = delete;
     PostHogTelemetry& operator=(const PostHogTelemetry&) = delete;
 
-    void CaptureExtensionLoad(const std::string& extension_name);
-    void CaptureFunctionExecution(const std::string& function_name, const std::string& function_version = "0.1.0");
+    // Capture extension load event with name and version
+    void CaptureExtensionLoad(const std::string& extension_name,
+                              const std::string& extension_version = "0.1.0");
+
+    // Capture function execution event
+    void CaptureFunctionExecution(const std::string& function_name,
+                                  const std::string& function_version = "0.1.0");
 
     bool IsEnabled();
     void SetEnabled(bool enabled);
-    
+
     std::string GetAPIKey();
     void SetAPIKey(std::string new_key);
 
@@ -121,10 +126,10 @@ private:
     ~PostHogTelemetry();
 
     void EnsureQueueInitialized();
-    
+
     // Platform specific MAC address retrieval
     static std::string GetMacAddress();
-    
+
 #ifdef __linux__
     static bool IsPhysicalDevice(const std::string& device);
     static std::string FindFirstPhysicalDevice();
@@ -137,4 +142,3 @@ private:
 };
 
 } // namespace duckdb
-

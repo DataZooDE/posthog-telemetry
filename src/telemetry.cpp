@@ -4,8 +4,10 @@
 #include "duckdb/common/string_util.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -34,11 +36,8 @@
 #endif
 
 // DuckDB dependencies
-// Ensure these are available in your build environment
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.hpp"
-#include "duckdb/execution/expression_executor.hpp" 
-#include "re2/re2.h"
 
 namespace duckdb {
 
@@ -68,11 +67,16 @@ std::string PostHogEvent::GetNowISO8601() const
 }
 
 // Helper function to process the event
-static void PostHogProcess(const std::string api_key, const PostHogEvent &event) 
+static void PostHogProcess(const std::string api_key, const PostHogEvent &event)
 {
-    // Using RE2 from DuckDB dependencies if needed, though currently unused in logic below
-    // auto re = re2::RE2("*"); 
-    
+    // Check if telemetry is disabled via environment variable
+    const char* disable_telemetry = std::getenv("DATAZOO_DISABLE_TELEMETRY");
+    if (disable_telemetry && (std::string(disable_telemetry) == "1" ||
+                              std::string(disable_telemetry) == "true" ||
+                              std::string(disable_telemetry) == "yes")) {
+        return; // Skip telemetry
+    }
+
     std::string payload = StringUtil::Format(R"(
         {
             "api_key": "%s",
@@ -82,25 +86,33 @@ static void PostHogProcess(const std::string api_key, const PostHogEvent &event)
                 "properties": %s,
                 "timestamp": "%s"
             }]
-        }   
-    )", api_key, event.event_name, event.distinct_id, 
+        }
+    )", api_key, event.event_name, event.distinct_id,
         event.GetPropertiesJson(), event.GetNowISO8601());
 
     try {
-        // Depending on how httplib is included in DuckDB, the namespace might vary.
-        // The snippet used duckdb_httplib_openssl.
+        // NOTE: There are known OpenSSL memory leaks when creating SSL clients
+        // This is a limitation of the httplib library and OpenSSL integration
+        // The leaks are primarily in SSL context creation and are not easily fixable
+        // from application code. The client.stop() call helps but doesn't eliminate all leaks.
+        // To avoid these leaks in development, set DATAZOO_DISABLE_TELEMETRY=1
         auto cli = duckdb_httplib_openssl::Client("https://eu.posthog.com");
-        auto url = "/batch/";
         if (cli.is_valid() == false) {
             return;
         }
+        auto url = "/batch/";
         auto res = cli.Post(url, payload, "application/json");
         if (res && res->status != 200) {
-            return;
+            std::cerr << "PostHog telemetry error: HTTP " << res->status << std::endl;
         }
+        // Explicitly stop the client to clean up SSL context
         cli.stop();
+    } catch (const std::exception& e) {
+        // Log the error but don't throw to avoid crashing the extension
+        std::cerr << "PostHog telemetry error: " << e.what() << std::endl;
     } catch (...) {
-        return;
+        // Catch any other exceptions
+        std::cerr << "PostHog telemetry unknown error" << std::endl;
     }
 }
 
@@ -108,7 +120,7 @@ static void PostHogProcess(const std::string api_key, const PostHogEvent &event)
 
 PostHogTelemetry::PostHogTelemetry()
     : _telemetry_enabled(true),
-      _api_key(""), // Default to empty, should be set by the extension
+      _api_key(""), // Default to empty, must be set by the extension
       _queue(nullptr)
 {  }
 
@@ -132,16 +144,16 @@ void PostHogTelemetry::EnsureQueueInitialized()
     }
 }
 
-void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name)
+void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
+                                            const std::string& extension_version)
 {
     if (!_telemetry_enabled) {
         return;
     }
-    
+
     // If API key is not set, we can't send telemetry
     if (_api_key.empty()) {
-        // Optionally log warning? For now silent fail.
-        return; 
+        return;
     }
 
     PostHogEvent event = {
@@ -149,24 +161,18 @@ void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name)
         GetMacAddressSafe(),
         {
             {"extension_name", extension_name},
-            {"extension_version", "0.1.0"}, // Could be parameterized
-            {"extension_platform", "linux" } // Could be detected dynamically
+            {"extension_version", extension_version},
+            {"extension_platform", DuckDB::Platform()}
         }
     };
-    
-    // Update platform dynamically if possible, simplified for now to match snippet's intent
-    #ifdef _WIN32
-    event.properties["extension_platform"] = "windows";
-    #elif __APPLE__
-    event.properties["extension_platform"] = "macos";
-    #endif
 
     auto api_key = this->_api_key;
     EnsureQueueInitialized();
     _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
 }
 
-void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name, const std::string& function_version)
+void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name,
+                                                const std::string& function_version)
 {
     if (!_telemetry_enabled || _api_key.empty()) {
         return;
@@ -186,30 +192,30 @@ void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name
 }
 
 
-bool PostHogTelemetry::IsEnabled() 
+bool PostHogTelemetry::IsEnabled()
 {
     return _telemetry_enabled;
 }
 
-void PostHogTelemetry::SetEnabled(bool enabled) 
+void PostHogTelemetry::SetEnabled(bool enabled)
 {
     // atomic, no lock needed for bool
     _telemetry_enabled = enabled;
 }
 
-std::string PostHogTelemetry::GetAPIKey() 
+std::string PostHogTelemetry::GetAPIKey()
 {
     std::lock_guard<std::mutex> t(_thread_lock);
     return _api_key;
 }
 
-void PostHogTelemetry::SetAPIKey(std::string new_key) 
+void PostHogTelemetry::SetAPIKey(std::string new_key)
 {
     std::lock_guard<std::mutex> t(_thread_lock);
     _api_key = new_key;
 }
 
-std::string PostHogTelemetry::GetMacAddressSafe() 
+std::string PostHogTelemetry::GetMacAddressSafe()
 {
     try {
         return GetMacAddress();
@@ -220,7 +226,7 @@ std::string PostHogTelemetry::GetMacAddressSafe()
 
 #ifdef __linux__
 
-std::string PostHogTelemetry::GetMacAddress() 
+std::string PostHogTelemetry::GetMacAddress()
 {
     auto device = FindFirstPhysicalDevice();
     if (device.empty()) {
@@ -242,7 +248,7 @@ bool PostHogTelemetry::IsPhysicalDevice(const std::string& device) {
     return access(path.c_str(), F_OK) != -1;
 }
 
-std::string PostHogTelemetry::FindFirstPhysicalDevice() 
+std::string PostHogTelemetry::FindFirstPhysicalDevice()
 {
     DIR* dir = opendir("/sys/class/net");
     if (!dir) {
@@ -274,7 +280,7 @@ std::string PostHogTelemetry::FindFirstPhysicalDevice()
 
 #elif _WIN32
 
-std::string PostHogTelemetry::GetMacAddress() 
+std::string PostHogTelemetry::GetMacAddress()
 {
     ULONG out_buf_len = sizeof(IP_ADAPTER_INFO);
     std::vector<BYTE> buffer(out_buf_len);
@@ -307,7 +313,7 @@ std::string PostHogTelemetry::GetMacAddress()
 
 #elif __APPLE__
 
-std::string PostHogTelemetry::GetMacAddress() 
+std::string PostHogTelemetry::GetMacAddress()
 {
     struct ifaddrs *ifap, *ifa;
     struct sockaddr_dl *sdl = nullptr;
@@ -339,7 +345,7 @@ std::string PostHogTelemetry::GetMacAddress()
 
 #else
 
-std::string PostHogTelemetry::GetMacAddress() 
+std::string PostHogTelemetry::GetMacAddress()
 {
     return "";
 }
@@ -347,4 +353,3 @@ std::string PostHogTelemetry::GetMacAddress()
 #endif
 
 } // namespace duckdb
-
