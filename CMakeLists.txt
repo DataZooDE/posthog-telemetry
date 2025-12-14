@@ -23,3 +23,8 @@ endif()
 # Standard C++17
 target_compile_features(posthog_telemetry PUBLIC cxx_std_17)
 
+# Unit tests (optional)
+option(BUILD_UNITTESTS "Build PostHog Telemetry Unit Tests." OFF)
+if(${BUILD_UNITTESTS})
+    add_subdirectory(test)
+endif()
