@@ -24,6 +24,9 @@ struct PostHogEvent {
     std::string GetNowISO8601() const;
 };
 
+// Free function for processing events (exposed for testing)
+void PostHogProcess(const std::string api_key, const PostHogEvent &event);
+
 // Simple thread-safe task queue for background telemetry processing
 template<typename T>
 class TelemetryTaskQueue {
@@ -119,6 +122,8 @@ public:
     std::string GetAPIKey();
     void SetAPIKey(std::string new_key);
 
+    // Public static methods for MAC address (exposed for testing)
+    static std::string GetMacAddress();
     static std::string GetMacAddressSafe();
 
 private:
@@ -126,9 +131,6 @@ private:
     ~PostHogTelemetry();
 
     void EnsureQueueInitialized();
-
-    // Platform specific MAC address retrieval
-    static std::string GetMacAddress();
 
 #ifdef __linux__
     static bool IsPhysicalDevice(const std::string& device);

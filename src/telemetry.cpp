@@ -7,7 +7,6 @@
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
-#include <iostream>
 #include <string>
 #include <vector>
 
@@ -66,8 +65,8 @@ std::string PostHogEvent::GetNowISO8601() const
     return std::string(buffer);
 }
 
-// Helper function to process the event
-static void PostHogProcess(const std::string api_key, const PostHogEvent &event)
+// Free function for processing events (exposed for testing)
+void PostHogProcess(const std::string api_key, const PostHogEvent &event)
 {
     // Check if telemetry is disabled via environment variable
     const char* disable_telemetry = std::getenv("DATAZOO_DISABLE_TELEMETRY");
@@ -91,28 +90,21 @@ static void PostHogProcess(const std::string api_key, const PostHogEvent &event)
         event.GetPropertiesJson(), event.GetNowISO8601());
 
     try {
-        // NOTE: There are known OpenSSL memory leaks when creating SSL clients
-        // This is a limitation of the httplib library and OpenSSL integration
-        // The leaks are primarily in SSL context creation and are not easily fixable
-        // from application code. The client.stop() call helps but doesn't eliminate all leaks.
-        // To avoid these leaks in development, set DATAZOO_DISABLE_TELEMETRY=1
         auto cli = duckdb_httplib_openssl::Client("https://eu.posthog.com");
         if (cli.is_valid() == false) {
+            // Silently fail instead of throwing - telemetry should not break the application
             return;
         }
         auto url = "/batch/";
         auto res = cli.Post(url, payload, "application/json");
         if (res && res->status != 200) {
-            std::cerr << "PostHog telemetry error: HTTP " << res->status << std::endl;
+            // Silently fail instead of throwing - telemetry should not break the application
+            return;
         }
-        // Explicitly stop the client to clean up SSL context
         cli.stop();
-    } catch (const std::exception& e) {
-        // Log the error but don't throw to avoid crashing the extension
-        std::cerr << "PostHog telemetry error: " << e.what() << std::endl;
     } catch (...) {
-        // Catch any other exceptions
-        std::cerr << "PostHog telemetry unknown error" << std::endl;
+        // Silently fail instead of throwing - telemetry should not break the application
+        return;
     }
 }
 
@@ -120,7 +112,7 @@ static void PostHogProcess(const std::string api_key, const PostHogEvent &event)
 
 PostHogTelemetry::PostHogTelemetry()
     : _telemetry_enabled(true),
-      _api_key(""), // Default to empty, must be set by the extension
+      _api_key("phc_t3wwRLtpyEmLHYaZCSszG0MqVr74J6wnCrj9D41zk2t"),
       _queue(nullptr)
 {  }
 
@@ -151,11 +143,6 @@ void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
         return;
     }
 
-    // If API key is not set, we can't send telemetry
-    if (_api_key.empty()) {
-        return;
-    }
-
     PostHogEvent event = {
         "extension_load",
         GetMacAddressSafe(),
@@ -174,7 +161,7 @@ void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
 void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name,
                                                 const std::string& function_version)
 {
-    if (!_telemetry_enabled || _api_key.empty()) {
+    if (!_telemetry_enabled) {
         return;
     }
 
@@ -199,7 +186,7 @@ bool PostHogTelemetry::IsEnabled()
 
 void PostHogTelemetry::SetEnabled(bool enabled)
 {
-    // atomic, no lock needed for bool
+    std::lock_guard<std::mutex> t(_thread_lock);
     _telemetry_enabled = enabled;
 }
 
