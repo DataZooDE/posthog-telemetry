@@ -2,19 +2,32 @@ cmake_minimum_required(VERSION 3.10)
 
 project(posthog_telemetry)
 
+# For standalone build (CI), find DuckDB headers
+# When used as submodule in a DuckDB extension, these paths come from parent project
+if(EXISTS "${CMAKE_SOURCE_DIR}/duckdb/src/include")
+    set(DUCKDB_SRC_INCLUDE "${CMAKE_SOURCE_DIR}/duckdb/src/include")
+    set(DUCKDB_THIRD_PARTY "${CMAKE_SOURCE_DIR}/duckdb/third_party")
+    message(STATUS "Found DuckDB headers at ${CMAKE_SOURCE_DIR}/duckdb")
+endif()
+
 # Define the library
 add_library(posthog_telemetry STATIC
     src/telemetry.cpp
 )
 
 # Include directories
-target_include_directories(posthog_telemetry PUBLIC 
+target_include_directories(posthog_telemetry PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# We assume DuckDB and its dependencies (RE2, OpenSSL, etc.) are available 
-# in the parent project's scope or standard paths. 
-# This library is intended to be statically linked into a DuckDB extension.
+# Add DuckDB paths if found (standalone build)
+if(DUCKDB_SRC_INCLUDE)
+    target_include_directories(posthog_telemetry PUBLIC
+        ${DUCKDB_SRC_INCLUDE}
+        ${DUCKDB_THIRD_PARTY}
+        ${DUCKDB_THIRD_PARTY}/httplib
+    )
+endif()
 
 if (WIN32)
     target_link_libraries(posthog_telemetry PUBLIC iphlpapi)
