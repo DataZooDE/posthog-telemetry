@@ -3,7 +3,7 @@
 # 1. Standalone build (CI) - DuckDB checked out to ${CMAKE_SOURCE_DIR}/duckdb
 # 2. Submodule in erpl - DuckDB at ${CMAKE_SOURCE_DIR}/duckdb (erpl's root)
 
-find_package(OpenSSL REQUIRED)
+# Note: OpenSSL is found and linked via posthog_telemetry target (PUBLIC dependency)
 
 # Find DuckDB headers - try multiple locations
 if(EXISTS "${CMAKE_SOURCE_DIR}/duckdb/third_party/catch")
@@ -31,14 +31,13 @@ if(DUCKDB_LIB_DIR)
     endif()
 endif()
 
-# Include directories
+# Include directories (OpenSSL includes inherited from posthog_telemetry target)
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     ${DUCKDB_THIRD_PARTY}/catch
     ${DUCKDB_THIRD_PARTY}/httplib
     ${DUCKDB_THIRD_PARTY}
     ${DUCKDB_SRC_INCLUDE}
-    ${OPENSSL_INCLUDE_DIR}
 )
 
 # Also include DuckDB lib headers if provided
@@ -58,7 +57,6 @@ add_executable(posthog_telemetry_tests ${TEST_SOURCES})
 
 target_link_libraries(posthog_telemetry_tests
     posthog_telemetry
-    ${OPENSSL_LIBRARIES}
 )
 
 # Link DuckDB library for standalone builds
