@@ -8,6 +8,7 @@ on:
 
 env:
   DUCKDB_VERSION: v1.4.3
+  DATAZOO_DISABLE_TELEMETRY: "1"
 
 jobs:
   test:
