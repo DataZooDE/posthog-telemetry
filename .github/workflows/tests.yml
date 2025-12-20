@@ -21,6 +21,8 @@ jobs:
             duckdb_lib: libduckdb-linux-amd64.zip
           - os: macos-latest
             duckdb_lib: libduckdb-osx-universal.zip
+          - os: windows-latest
+            duckdb_lib: libduckdb-windows-amd64.zip
 
     steps:
       - name: Checkout posthog-telemetry
@@ -34,6 +36,7 @@ jobs:
           ref: ${{ env.DUCKDB_VERSION }}
 
       - name: Download DuckDB library
+        shell: bash
         run: |
           curl -L -o duckdb-lib.zip https://github.com/duckdb/duckdb/releases/download/${{ env.DUCKDB_VERSION }}/${{ matrix.duckdb_lib }}
           unzip duckdb-lib.zip -d duckdb-lib
@@ -49,6 +52,11 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install cmake ninja openssl@3
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install ninja openssl -y
 
       - name: Configure (Linux)
         if: runner.os == 'Linux'
@@ -67,12 +75,29 @@ jobs:
             -DDUCKDB_LIB_DIR=${{ github.workspace }}/duckdb-lib \
             -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
 
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cmake -B build -G Ninja \
+            -DBUILD_UNITTESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDUCKDB_LIB_DIR=${{ github.workspace }}/duckdb-lib
+
       - name: Build
+        shell: bash
         run: cmake --build build
 
+      - name: Copy DuckDB DLL (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cp duckdb-lib/duckdb.dll build/test/cpp/
+
       - name: Run tests
+        shell: bash
         run: ./build/test/cpp/posthog_telemetry_tests --reporter console
 
       - name: Run tests with verbose output on failure
         if: failure()
+        shell: bash
         run: ./build/test/cpp/posthog_telemetry_tests --reporter console -s
