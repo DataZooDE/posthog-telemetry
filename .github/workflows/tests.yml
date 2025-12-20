@@ -78,13 +78,13 @@ jobs:
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          cmake -B build -G Ninja \
-            -DBUILD_UNITTESTS=ON \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DDUCKDB_LIB_DIR=${{ github.workspace }}/duckdb-lib \
-            -DCMAKE_TOOLCHAIN_FILE=$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake
+          cmake -B build -G Ninja `
+            -DBUILD_UNITTESTS=ON `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DDUCKDB_LIB_DIR="${{ github.workspace }}/duckdb-lib" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Build
         shell: bash
