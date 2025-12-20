@@ -56,7 +56,6 @@ jobs:
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
-          choco install ninja -y
           vcpkg install openssl:x64-windows
 
       - name: Configure (Linux)
@@ -80,26 +79,44 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cmake -B build -G Ninja `
+          cmake -B build -G "Visual Studio 17 2022" -A x64 `
             -DBUILD_UNITTESTS=ON `
             -DCMAKE_BUILD_TYPE=Release `
             -DDUCKDB_LIB_DIR="${{ github.workspace }}/duckdb-lib" `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
-      - name: Build
+      - name: Build (Linux/macOS)
+        if: runner.os != 'Windows'
         shell: bash
         run: cmake --build build
 
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake --build build --config Release
+
       - name: Copy DuckDB DLL (Windows)
         if: runner.os == 'Windows'
-        shell: bash
-        run: cp duckdb-lib/duckdb.dll build/test/cpp/
+        shell: pwsh
+        run: |
+          Copy-Item duckdb-lib/duckdb.dll build/test/cpp/Release/
 
-      - name: Run tests
+      - name: Run tests (Linux/macOS)
+        if: runner.os != 'Windows'
         shell: bash
         run: ./build/test/cpp/posthog_telemetry_tests --reporter console
 
-      - name: Run tests with verbose output on failure
-        if: failure()
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./build/test/cpp/Release/posthog_telemetry_tests.exe --reporter console
+
+      - name: Run tests with verbose output on failure (Linux/macOS)
+        if: failure() && runner.os != 'Windows'
         shell: bash
         run: ./build/test/cpp/posthog_telemetry_tests --reporter console -s
+
+      - name: Run tests with verbose output on failure (Windows)
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: ./build/test/cpp/Release/posthog_telemetry_tests.exe --reporter console -s
