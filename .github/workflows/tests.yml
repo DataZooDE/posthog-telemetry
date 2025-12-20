@@ -83,7 +83,7 @@ jobs:
             -DBUILD_UNITTESTS=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DDUCKDB_LIB_DIR=${{ github.workspace }}/duckdb-lib \
-            -DOPENSSL_ROOT_DIR="C:/Program Files/OpenSSL"
+            -DOPENSSL_ROOT_DIR="C:/Program Files/OpenSSL-Win64"
 
       - name: Build
         shell: bash
