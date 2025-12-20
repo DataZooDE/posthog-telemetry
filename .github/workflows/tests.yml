@@ -82,7 +82,8 @@ jobs:
           cmake -B build -G Ninja \
             -DBUILD_UNITTESTS=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DDUCKDB_LIB_DIR=${{ github.workspace }}/duckdb-lib
+            -DDUCKDB_LIB_DIR=${{ github.workspace }}/duckdb-lib \
+            -DOPENSSL_ROOT_DIR="C:/Program Files/OpenSSL"
 
       - name: Build
         shell: bash
