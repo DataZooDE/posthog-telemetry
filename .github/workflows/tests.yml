@@ -77,13 +77,19 @@ jobs:
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          cmake -B build -G Ninja \
-            -DBUILD_UNITTESTS=ON \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DDUCKDB_LIB_DIR=${{ github.workspace }}/duckdb-lib \
-            -DOPENSSL_ROOT_DIR="C:/OpenSSL-Win64"
+          # Find OpenSSL installation path
+          $opensslPath = (Get-ChildItem -Path "C:\Program Files" -Filter "OpenSSL*" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          if (-not $opensslPath) {
+            $opensslPath = (Get-ChildItem -Path "C:\" -Filter "OpenSSL*" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          }
+          Write-Host "Found OpenSSL at: $opensslPath"
+          cmake -B build -G Ninja `
+            -DBUILD_UNITTESTS=ON `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DDUCKDB_LIB_DIR="${{ github.workspace }}/duckdb-lib" `
+            -DOPENSSL_ROOT_DIR="$opensslPath"
 
       - name: Build
         shell: bash
