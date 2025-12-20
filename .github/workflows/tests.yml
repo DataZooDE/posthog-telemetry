@@ -56,7 +56,8 @@ jobs:
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
-          choco install ninja openssl -y
+          choco install ninja -y
+          vcpkg install openssl:x64-windows
 
       - name: Configure (Linux)
         if: runner.os == 'Linux'
@@ -77,19 +78,13 @@ jobs:
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: bash
         run: |
-          # Find OpenSSL installation path
-          $opensslPath = (Get-ChildItem -Path "C:\Program Files" -Filter "OpenSSL*" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
-          if (-not $opensslPath) {
-            $opensslPath = (Get-ChildItem -Path "C:\" -Filter "OpenSSL*" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
-          }
-          Write-Host "Found OpenSSL at: $opensslPath"
-          cmake -B build -G Ninja `
-            -DBUILD_UNITTESTS=ON `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DDUCKDB_LIB_DIR="${{ github.workspace }}/duckdb-lib" `
-            -DOPENSSL_ROOT_DIR="$opensslPath"
+          cmake -B build -G Ninja \
+            -DBUILD_UNITTESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDUCKDB_LIB_DIR=${{ github.workspace }}/duckdb-lib \
+            -DCMAKE_TOOLCHAIN_FILE=$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake
 
       - name: Build
         shell: bash
