@@ -122,6 +122,12 @@ public:
     std::string GetAPIKey();
     void SetAPIKey(std::string new_key);
 
+    // DuckDB version and platform (for telemetry)
+    void SetDuckDBVersion(const std::string& version);
+    void SetDuckDBPlatform(const std::string& platform);
+    std::string GetDuckDBVersion();
+    std::string GetDuckDBPlatform();
+
     // Public static methods for MAC address (exposed for testing)
     static std::string GetMacAddress();
     static std::string GetMacAddressSafe();
@@ -139,6 +145,8 @@ private:
 
     std::atomic<bool> _telemetry_enabled;
     std::string _api_key;
+    std::string _duckdb_version;   // Empty = use DuckDB::LibraryVersion()
+    std::string _duckdb_platform;  // Empty = use DuckDB::Platform()
     std::mutex _thread_lock;
     std::unique_ptr<TelemetryTaskQueue<PostHogEvent>> _queue;
 };

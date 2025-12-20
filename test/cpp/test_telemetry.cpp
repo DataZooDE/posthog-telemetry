@@ -221,3 +221,103 @@ TEST_CASE("PostHogTelemetry - Default API key is set", "[telemetry]") {
     REQUIRE(!key.empty());
     REQUIRE(key.substr(0, 4) == "phc_");
 }
+
+TEST_CASE("PostHogTelemetry - DuckDB version default", "[telemetry]") {
+    auto& telemetry = PostHogTelemetry::Instance();
+
+    // Clear any override first
+    telemetry.SetDuckDBVersion("");
+
+    // Default should use DuckDB::LibraryVersion()
+    std::string version = telemetry.GetDuckDBVersion();
+    REQUIRE(!version.empty());
+
+    // Should match DuckDB::LibraryVersion()
+    REQUIRE(version == DuckDB::LibraryVersion());
+}
+
+TEST_CASE("PostHogTelemetry - DuckDB version override", "[telemetry]") {
+    auto& telemetry = PostHogTelemetry::Instance();
+
+    // Store original (should be empty or previous override)
+    telemetry.SetDuckDBVersion("");
+    std::string original = telemetry.GetDuckDBVersion();
+
+    // Set custom version
+    telemetry.SetDuckDBVersion("custom-v1.0.0-test");
+    REQUIRE(telemetry.GetDuckDBVersion() == "custom-v1.0.0-test");
+
+    // Clear override - should return to default
+    telemetry.SetDuckDBVersion("");
+    REQUIRE(telemetry.GetDuckDBVersion() == DuckDB::LibraryVersion());
+}
+
+TEST_CASE("PostHogTelemetry - DuckDB platform default", "[telemetry]") {
+    auto& telemetry = PostHogTelemetry::Instance();
+
+    // Clear any override first
+    telemetry.SetDuckDBPlatform("");
+
+    // Default should use DuckDB::Platform()
+    std::string platform = telemetry.GetDuckDBPlatform();
+    REQUIRE(!platform.empty());
+
+    // Should match DuckDB::Platform()
+    REQUIRE(platform == DuckDB::Platform());
+}
+
+TEST_CASE("PostHogTelemetry - DuckDB platform override", "[telemetry]") {
+    auto& telemetry = PostHogTelemetry::Instance();
+
+    // Clear any existing override
+    telemetry.SetDuckDBPlatform("");
+
+    // Set custom platform
+    telemetry.SetDuckDBPlatform("custom-linux-x86_64");
+    REQUIRE(telemetry.GetDuckDBPlatform() == "custom-linux-x86_64");
+
+    // Clear override - should return to default
+    telemetry.SetDuckDBPlatform("");
+    REQUIRE(telemetry.GetDuckDBPlatform() == DuckDB::Platform());
+}
+
+TEST_CASE("PostHogTelemetry - DuckDB version/platform thread safety", "[telemetry]") {
+    auto& telemetry = PostHogTelemetry::Instance();
+
+    // Clear any overrides
+    telemetry.SetDuckDBVersion("");
+    telemetry.SetDuckDBPlatform("");
+
+    std::vector<std::thread> threads;
+    std::atomic<int> errors{0};
+
+    // Multiple threads setting and getting version/platform
+    for (int i = 0; i < 10; i++) {
+        threads.emplace_back([&telemetry, &errors, i]() {
+            try {
+                for (int j = 0; j < 100; j++) {
+                    telemetry.SetDuckDBVersion("ver_" + std::to_string(i) + "_" + std::to_string(j));
+                    telemetry.SetDuckDBPlatform("plat_" + std::to_string(i) + "_" + std::to_string(j));
+                    std::string ver = telemetry.GetDuckDBVersion();
+                    std::string plat = telemetry.GetDuckDBPlatform();
+                    // Just verify we get something back
+                    if (ver.empty() || plat.empty()) {
+                        errors++;
+                    }
+                }
+            } catch (...) {
+                errors++;
+            }
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    REQUIRE(errors == 0);
+
+    // Restore defaults
+    telemetry.SetDuckDBVersion("");
+    telemetry.SetDuckDBPlatform("");
+}

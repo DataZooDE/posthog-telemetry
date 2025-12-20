@@ -149,7 +149,8 @@ void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
         {
             {"extension_name", extension_name},
             {"extension_version", extension_version},
-            {"extension_platform", DuckDB::Platform()}
+            {"extension_platform", GetDuckDBPlatform()},
+            {"duckdb_version", GetDuckDBVersion()}
         }
     };
 
@@ -170,7 +171,9 @@ void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name
         GetMacAddressSafe(),
         {
             {"function_name", function_name},
-            {"function_version", function_version}
+            {"function_version", function_version},
+            {"extension_platform", GetDuckDBPlatform()},
+            {"duckdb_version", GetDuckDBVersion()}
         }
     };
     auto api_key = this->_api_key;
@@ -200,6 +203,36 @@ void PostHogTelemetry::SetAPIKey(std::string new_key)
 {
     std::lock_guard<std::mutex> t(_thread_lock);
     _api_key = new_key;
+}
+
+void PostHogTelemetry::SetDuckDBVersion(const std::string& version)
+{
+    std::lock_guard<std::mutex> t(_thread_lock);
+    _duckdb_version = version;
+}
+
+void PostHogTelemetry::SetDuckDBPlatform(const std::string& platform)
+{
+    std::lock_guard<std::mutex> t(_thread_lock);
+    _duckdb_platform = platform;
+}
+
+std::string PostHogTelemetry::GetDuckDBVersion()
+{
+    std::lock_guard<std::mutex> t(_thread_lock);
+    if (!_duckdb_version.empty()) {
+        return _duckdb_version;
+    }
+    return DuckDB::LibraryVersion();
+}
+
+std::string PostHogTelemetry::GetDuckDBPlatform()
+{
+    std::lock_guard<std::mutex> t(_thread_lock);
+    if (!_duckdb_platform.empty()) {
+        return _duckdb_platform;
+    }
+    return DuckDB::Platform();
 }
 
 std::string PostHogTelemetry::GetMacAddressSafe()
