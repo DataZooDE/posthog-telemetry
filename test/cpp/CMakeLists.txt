@@ -2,17 +2,23 @@
 # Supports both:
 # 1. Standalone build (CI) - DuckDB checked out to ${CMAKE_SOURCE_DIR}/duckdb
 # 2. Submodule in erpl - DuckDB at ${CMAKE_SOURCE_DIR}/duckdb (erpl's root)
+# 3. Build from erpl where CMAKE_SOURCE_DIR is duckdb itself
 
 # Note: OpenSSL is found and linked via posthog_telemetry target (PUBLIC dependency)
 
 # Find DuckDB headers - try multiple locations
-if(EXISTS "${CMAKE_SOURCE_DIR}/duckdb/third_party/catch")
+if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/catch")
+    # When CMAKE_SOURCE_DIR is the DuckDB directory itself (erpl build)
+    set(DUCKDB_THIRD_PARTY "${CMAKE_SOURCE_DIR}/third_party")
+    set(DUCKDB_SRC_INCLUDE "${CMAKE_SOURCE_DIR}/src/include")
+    message(STATUS "Found DuckDB at ${CMAKE_SOURCE_DIR}")
+elseif(EXISTS "${CMAKE_SOURCE_DIR}/duckdb/third_party/catch")
     # Both standalone CI and erpl submodule use this path structure
     set(DUCKDB_THIRD_PARTY "${CMAKE_SOURCE_DIR}/duckdb/third_party")
     set(DUCKDB_SRC_INCLUDE "${CMAKE_SOURCE_DIR}/duckdb/src/include")
     message(STATUS "Found DuckDB at ${CMAKE_SOURCE_DIR}/duckdb")
 else()
-    message(FATAL_ERROR "Cannot find DuckDB headers. Please ensure DuckDB is available at ${CMAKE_SOURCE_DIR}/duckdb")
+    message(FATAL_ERROR "Cannot find DuckDB headers. Please ensure DuckDB is available at ${CMAKE_SOURCE_DIR}/duckdb or ${CMAKE_SOURCE_DIR}")
 endif()
 
 # Find DuckDB library for standalone builds
