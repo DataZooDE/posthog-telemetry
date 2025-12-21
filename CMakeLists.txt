@@ -43,16 +43,6 @@ endif()
 # Standard C++17
 target_compile_features(posthog_telemetry PUBLIC cxx_std_17)
 
-# Install target for DuckDB export set integration
-if(DEFINED DUCKDB_EXPORT_SET)
-    install(
-        TARGETS posthog_telemetry
-        EXPORT "${DUCKDB_EXPORT_SET}"
-        LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
-        ARCHIVE DESTINATION "${INSTALL_LIB_DIR}"
-    )
-endif()
-
 # Unit tests (optional)
 option(BUILD_UNITTESTS "Build PostHog Telemetry Unit Tests." OFF)
 if(${BUILD_UNITTESTS})
