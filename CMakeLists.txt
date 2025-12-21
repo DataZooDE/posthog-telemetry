@@ -18,15 +18,20 @@ add_library(posthog_telemetry STATIC
     src/telemetry.cpp
 )
 
-# Include directories
+# Include directories - use BUILD_INTERFACE to avoid export issues
+# The library headers need to be PUBLIC so consumers can include telemetry.hpp
 target_include_directories(posthog_telemetry PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+
+# Build-only includes - these are only needed for compilation, not for consumers
+target_include_directories(posthog_telemetry PRIVATE
     ${OPENSSL_INCLUDE_DIR}
 )
 
-# Add DuckDB paths if found (standalone build)
+# Add DuckDB paths if found (standalone build) - PRIVATE since not needed by consumers
 if(DUCKDB_SRC_INCLUDE)
-    target_include_directories(posthog_telemetry PUBLIC
+    target_include_directories(posthog_telemetry PRIVATE
         ${DUCKDB_SRC_INCLUDE}
         ${DUCKDB_THIRD_PARTY}
         ${DUCKDB_THIRD_PARTY}/httplib
@@ -42,6 +47,16 @@ endif()
 
 # Standard C++17
 target_compile_features(posthog_telemetry PUBLIC cxx_std_17)
+
+# Install target for DuckDB export set integration
+if(DEFINED DUCKDB_EXPORT_SET)
+    install(
+        TARGETS posthog_telemetry
+        EXPORT "${DUCKDB_EXPORT_SET}"
+        LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+        ARCHIVE DESTINATION "${INSTALL_LIB_DIR}"
+    )
+endif()
 
 # Unit tests (optional)
 option(BUILD_UNITTESTS "Build PostHog Telemetry Unit Tests." OFF)
