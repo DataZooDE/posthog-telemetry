@@ -139,6 +139,9 @@ void PostHogTelemetry::EnsureQueueInitialized()
 void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
                                             const std::string& extension_version)
 {
+    // Store extension name as default for CaptureFunctionExecution
+    SetExtensionName(extension_name);
+
     if (!_telemetry_enabled) {
         return;
     }
@@ -159,7 +162,9 @@ void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
     _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
 }
 
+// Overload 1: Explicit extension_name
 void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name,
+                                                const std::string& extension_name,
                                                 const std::string& function_version)
 {
     if (!_telemetry_enabled) {
@@ -172,6 +177,7 @@ void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name
         {
             {"function_name", function_name},
             {"function_version", function_version},
+            {"extension_name", extension_name},
             {"extension_platform", GetDuckDBPlatform()},
             {"duckdb_version", GetDuckDBVersion()}
         }
@@ -179,6 +185,13 @@ void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name
     auto api_key = this->_api_key;
     EnsureQueueInitialized();
     _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
+}
+
+// Overload 2: Uses stored default extension_name
+void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name,
+                                                const std::string& function_version)
+{
+    CaptureFunctionExecution(function_name, GetExtensionName(), function_version);
 }
 
 
@@ -203,6 +216,18 @@ void PostHogTelemetry::SetAPIKey(std::string new_key)
 {
     std::lock_guard<std::mutex> t(_thread_lock);
     _api_key = new_key;
+}
+
+void PostHogTelemetry::SetExtensionName(const std::string& name)
+{
+    std::lock_guard<std::mutex> t(_thread_lock);
+    _extension_name = name;
+}
+
+std::string PostHogTelemetry::GetExtensionName()
+{
+    std::lock_guard<std::mutex> t(_thread_lock);
+    return _extension_name;
 }
 
 void PostHogTelemetry::SetDuckDBVersion(const std::string& version)

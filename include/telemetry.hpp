@@ -109,12 +109,23 @@ public:
     PostHogTelemetry& operator=(const PostHogTelemetry&) = delete;
 
     // Capture extension load event with name and version
+    // Also stores extension_name as default for CaptureFunctionExecution
     void CaptureExtensionLoad(const std::string& extension_name,
                               const std::string& extension_version = "0.1.0");
 
-    // Capture function execution event
+    // Capture function execution event - two overloads:
+    // 1. Explicit extension_name
+    void CaptureFunctionExecution(const std::string& function_name,
+                                  const std::string& extension_name,
+                                  const std::string& function_version);
+
+    // 2. Uses stored default extension_name (from CaptureExtensionLoad or SetExtensionName)
     void CaptureFunctionExecution(const std::string& function_name,
                                   const std::string& function_version = "0.1.0");
+
+    // Set/get default extension name for the instance
+    void SetExtensionName(const std::string& name);
+    std::string GetExtensionName();
 
     bool IsEnabled();
     void SetEnabled(bool enabled);
@@ -145,6 +156,7 @@ private:
 
     std::atomic<bool> _telemetry_enabled;
     std::string _api_key;
+    std::string _extension_name;   // Default extension name for CaptureFunctionExecution
     std::string _duckdb_version;   // Empty = use DuckDB::LibraryVersion()
     std::string _duckdb_platform;  // Empty = use DuckDB::Platform()
     std::mutex _thread_lock;
