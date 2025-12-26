@@ -58,8 +58,8 @@ if(DEFINED DUCKDB_EXPORT_SET)
     )
 endif()
 
-# Unit tests (optional)
-option(BUILD_UNITTESTS "Build PostHog Telemetry Unit Tests." OFF)
-if(${BUILD_UNITTESTS})
+# Unit tests (optional) - use unique option name to avoid conflict with parent projects
+option(POSTHOG_BUILD_TESTS "Build PostHog Telemetry Unit Tests." OFF)
+if(${POSTHOG_BUILD_TESTS})
     add_subdirectory(test)
 endif()
