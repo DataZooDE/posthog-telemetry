@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef ANOFOX_TELEMETRY_ENABLED
+
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
 
@@ -164,3 +166,43 @@ private:
 };
 
 } // namespace duckdb
+
+#else // !ANOFOX_TELEMETRY_ENABLED
+
+// No-op stubs: all telemetry calls compile to nothing on platforms without OpenSSL
+#include <string>
+
+namespace duckdb {
+
+class PostHogTelemetry {
+public:
+    static PostHogTelemetry& Instance() {
+        static PostHogTelemetry instance;
+        return instance;
+    }
+
+    PostHogTelemetry(const PostHogTelemetry&) = delete;
+    PostHogTelemetry& operator=(const PostHogTelemetry&) = delete;
+
+    void CaptureExtensionLoad(const std::string&, const std::string& = "0.1.0") {}
+    void CaptureFunctionExecution(const std::string&, const std::string&, const std::string&) {}
+    void CaptureFunctionExecution(const std::string&, const std::string& = "0.1.0") {}
+    void SetExtensionName(const std::string&) {}
+    std::string GetExtensionName() { return ""; }
+    bool IsEnabled() { return false; }
+    void SetEnabled(bool) {}
+    std::string GetAPIKey() { return ""; }
+    void SetAPIKey(const std::string&) {}
+    void SetDuckDBVersion(const std::string&) {}
+    void SetDuckDBPlatform(const std::string&) {}
+    std::string GetDuckDBVersion() { return ""; }
+    std::string GetDuckDBPlatform() { return ""; }
+
+private:
+    PostHogTelemetry() = default;
+    ~PostHogTelemetry() = default;
+};
+
+} // namespace duckdb
+
+#endif // ANOFOX_TELEMETRY_ENABLED

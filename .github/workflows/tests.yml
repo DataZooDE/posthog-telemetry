@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 env:
-  DUCKDB_VERSION: v1.4.3
+  DUCKDB_VERSION: v1.4.4
   DATAZOO_DISABLE_TELEMETRY: "1"
 
 jobs:

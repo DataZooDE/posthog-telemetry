@@ -18,6 +18,9 @@ add_library(posthog_telemetry STATIC
     src/telemetry.cpp
 )
 
+# Enable the real telemetry implementation (no-op stubs are only for consumers without OpenSSL)
+target_compile_definitions(posthog_telemetry PRIVATE ANOFOX_TELEMETRY_ENABLED)
+
 # Include directories - use BUILD_INTERFACE to avoid export issues
 # The library headers need to be PUBLIC so consumers can include telemetry.hpp
 target_include_directories(posthog_telemetry PUBLIC
