@@ -119,7 +119,11 @@ PostHogTelemetry::PostHogTelemetry()
 PostHogTelemetry::~PostHogTelemetry()
 {
     if (_queue) {
-        _queue->Stop();
+        // Use StopNoWait to avoid joining the worker thread during static
+        // destruction. At this point DuckDB internals (OpenSSL, StringUtil)
+        // used by PostHogProcess may already be destroyed, so waiting for
+        // the worker to finish its current HTTP request can segfault.
+        _queue->StopNoWait();
     }
 }
 

@@ -60,6 +60,21 @@ public:
         }
     }
 
+    // Signal stop without waiting for the worker thread to finish.
+    // Used during static destruction where joining may deadlock or
+    // segfault because DuckDB internals (OpenSSL, StringUtil) used
+    // by the worker may already be destroyed.
+    void StopNoWait() {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            stop_processing = true;
+        }
+        condition.notify_all();
+        if (worker_thread.joinable()) {
+            worker_thread.detach();
+        }
+    }
+
 private:
     struct QueueItem {
         TaskFunction task;
