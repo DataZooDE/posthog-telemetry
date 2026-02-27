@@ -2,6 +2,7 @@
 #include "telemetry.hpp"
 
 #include <chrono>
+#include <fstream>
 #include <regex>
 #include <thread>
 #include <vector>
@@ -228,20 +229,13 @@ TEST_CASE("PostHogTelemetry - DuckDB version default", "[telemetry]") {
     // Clear any override first
     telemetry.SetDuckDBVersion("");
 
-    // Default should use DuckDB::LibraryVersion()
+    // Default is "unknown" when no override is set
     std::string version = telemetry.GetDuckDBVersion();
-    REQUIRE(!version.empty());
-
-    // Should match DuckDB::LibraryVersion()
-    REQUIRE(version == DuckDB::LibraryVersion());
+    REQUIRE(version == "unknown");
 }
 
 TEST_CASE("PostHogTelemetry - DuckDB version override", "[telemetry]") {
     auto& telemetry = PostHogTelemetry::Instance();
-
-    // Store original (should be empty or previous override)
-    telemetry.SetDuckDBVersion("");
-    std::string original = telemetry.GetDuckDBVersion();
 
     // Set custom version
     telemetry.SetDuckDBVersion("custom-v1.0.0-test");
@@ -249,7 +243,7 @@ TEST_CASE("PostHogTelemetry - DuckDB version override", "[telemetry]") {
 
     // Clear override - should return to default
     telemetry.SetDuckDBVersion("");
-    REQUIRE(telemetry.GetDuckDBVersion() == DuckDB::LibraryVersion());
+    REQUIRE(telemetry.GetDuckDBVersion() == "unknown");
 }
 
 TEST_CASE("PostHogTelemetry - DuckDB platform default", "[telemetry]") {
@@ -258,12 +252,9 @@ TEST_CASE("PostHogTelemetry - DuckDB platform default", "[telemetry]") {
     // Clear any override first
     telemetry.SetDuckDBPlatform("");
 
-    // Default should use DuckDB::Platform()
+    // Default is a compile-time detected platform string
     std::string platform = telemetry.GetDuckDBPlatform();
     REQUIRE(!platform.empty());
-
-    // Should match DuckDB::Platform()
-    REQUIRE(platform == DuckDB::Platform());
 }
 
 TEST_CASE("PostHogTelemetry - DuckDB platform override", "[telemetry]") {
@@ -276,10 +267,56 @@ TEST_CASE("PostHogTelemetry - DuckDB platform override", "[telemetry]") {
     telemetry.SetDuckDBPlatform("custom-linux-x86_64");
     REQUIRE(telemetry.GetDuckDBPlatform() == "custom-linux-x86_64");
 
-    // Clear override - should return to default
+    // Clear override - should return to compile-time default
     telemetry.SetDuckDBPlatform("");
-    REQUIRE(telemetry.GetDuckDBPlatform() == DuckDB::Platform());
+    REQUIRE(!telemetry.GetDuckDBPlatform().empty());
 }
+
+TEST_CASE("PostHogTelemetry - GetDistinctId returns consistent value", "[telemetry]") {
+    std::string id1 = PostHogTelemetry::GetDistinctId();
+    std::string id2 = PostHogTelemetry::GetDistinctId();
+
+    REQUIRE(!id1.empty());
+    REQUIRE(id1 == id2);
+}
+
+TEST_CASE("PostHogTelemetry - GetDistinctId returns valid 64-char hex", "[telemetry]") {
+    std::string id = PostHogTelemetry::GetDistinctId();
+
+    REQUIRE(id.length() == 64);
+    std::regex hex_regex("^[0-9a-f]{64}$");
+    REQUIRE(std::regex_match(id, hex_regex));
+}
+
+TEST_CASE("PostHogTelemetry - GetDistinctIdFilePath returns valid path", "[telemetry]") {
+    std::string path = PostHogTelemetry::GetDistinctIdFilePath();
+
+    REQUIRE(!path.empty());
+    // datazoo on Unix, DataZoo on Windows
+    bool has_dir = path.find("datazoo") != std::string::npos
+                || path.find("DataZoo") != std::string::npos;
+    REQUIRE(has_dir);
+    REQUIRE(path.find("telemetry_id") != std::string::npos);
+}
+
+TEST_CASE("PostHogTelemetry - GetDistinctId file persists after call", "[telemetry]") {
+    std::string id = PostHogTelemetry::GetDistinctId();
+    std::string path = PostHogTelemetry::GetDistinctIdFilePath();
+
+    std::ifstream f(path);
+    REQUIRE(f.good());
+    std::string stored;
+    f >> stored;
+    REQUIRE(stored == id);
+}
+
+#ifdef __linux__
+TEST_CASE("PostHogTelemetry - GetMachineId non-empty on Linux", "[telemetry]") {
+    std::string machine_id = PostHogTelemetry::GetMachineId();
+    // /etc/machine-id should be present on standard Linux systems
+    REQUIRE(!machine_id.empty());
+}
+#endif
 
 TEST_CASE("PostHogTelemetry - DuckDB version/platform thread safety", "[telemetry]") {
     auto& telemetry = PostHogTelemetry::Instance();

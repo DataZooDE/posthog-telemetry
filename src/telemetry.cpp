@@ -1,9 +1,9 @@
 #define NOMINMAX
 
 #include "telemetry.hpp"
-#include "duckdb/common/string_util.hpp"
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
@@ -13,6 +13,7 @@
 #ifdef __linux__
 #include <unistd.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #endif
 
 #ifdef _WIN32
@@ -20,6 +21,7 @@
 #include <sstream>
 #include <winsock2.h>
 #include <iphlpapi.h>
+#include <direct.h>
 #ifndef _MSC_VER
 #define _MSC_VER 1936
 #endif
@@ -32,13 +34,47 @@
 #include <net/if.h>
 #include <net/if_dl.h>
 #include <cstring>
+#include <sys/stat.h>
+#include <IOKit/IOKitLib.h>
+#include <CoreFoundation/CoreFoundation.h>
 #endif
 
-// DuckDB dependencies
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.hpp"
+#include <openssl/sha.h>
 
 namespace duckdb {
+
+static std::string FormatStr(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int n = std::vsnprintf(nullptr, 0, fmt, args);
+    va_end(args);
+    std::string buf(n + 1, '\0');
+    va_start(args, fmt);
+    std::vsnprintf(&buf[0], n + 1, fmt, args);
+    va_end(args);
+    buf.resize(n);
+    return buf;
+}
+
+static std::string DetectPlatform() {
+#if   defined(_WIN32) && defined(_M_ARM64)
+    return "windows_arm64";
+#elif defined(_WIN32)
+    return "windows_amd64";
+#elif defined(__APPLE__) && defined(__arm64__)
+    return "osx_arm64";
+#elif defined(__APPLE__)
+    return "osx_amd64";
+#elif defined(__linux__) && defined(__aarch64__)
+    return "linux_arm64";
+#elif defined(__linux__)
+    return "linux_amd64";
+#else
+    return "unknown";
+#endif
+}
 
 std::string PostHogEvent::GetPropertiesJson() const
 {
@@ -49,7 +85,7 @@ std::string PostHogEvent::GetPropertiesJson() const
         if (!first) {
             json += ",";
         }
-        json += StringUtil::Format("\"%s\": \"%s\"", kv.first, kv.second);
+        json += FormatStr("\"%s\": \"%s\"", kv.first.c_str(), kv.second.c_str());
         first = false;
     }
     json += "}";
@@ -76,7 +112,7 @@ void PostHogProcess(const std::string api_key, const PostHogEvent &event)
         return; // Skip telemetry
     }
 
-    std::string payload = StringUtil::Format(R"(
+    std::string payload = FormatStr(R"(
         {
             "api_key": "%s",
             "batch": [{
@@ -86,8 +122,8 @@ void PostHogProcess(const std::string api_key, const PostHogEvent &event)
                 "timestamp": "%s"
             }]
         }
-    )", api_key, event.event_name, event.distinct_id,
-        event.GetPropertiesJson(), event.GetNowISO8601());
+    )", api_key.c_str(), event.event_name.c_str(), event.distinct_id.c_str(),
+        event.GetPropertiesJson().c_str(), event.GetNowISO8601().c_str());
 
     try {
         auto cli = duckdb_httplib_openssl::Client("https://eu.posthog.com");
@@ -148,7 +184,7 @@ void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
 
     PostHogEvent event = {
         "extension_load",
-        GetMacAddressSafe(),
+        GetDistinctId(),
         {
             {"extension_name", extension_name},
             {"extension_version", extension_version},
@@ -173,7 +209,7 @@ void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name
 
     PostHogEvent event = {
         "function_execution",
-        GetMacAddressSafe(),
+        GetDistinctId(),
         {
             {"function_name", function_name},
             {"function_version", function_version},
@@ -245,19 +281,13 @@ void PostHogTelemetry::SetDuckDBPlatform(const std::string& platform)
 std::string PostHogTelemetry::GetDuckDBVersion()
 {
     std::lock_guard<std::mutex> t(_thread_lock);
-    if (!_duckdb_version.empty()) {
-        return _duckdb_version;
-    }
-    return DuckDB::LibraryVersion();
+    return _duckdb_version.empty() ? "unknown" : _duckdb_version;
 }
 
 std::string PostHogTelemetry::GetDuckDBPlatform()
 {
     std::lock_guard<std::mutex> t(_thread_lock);
-    if (!_duckdb_platform.empty()) {
-        return _duckdb_platform;
-    }
-    return DuckDB::Platform();
+    return _duckdb_platform.empty() ? DetectPlatform() : _duckdb_platform;
 }
 
 std::string PostHogTelemetry::GetMacAddressSafe()
@@ -269,7 +299,91 @@ std::string PostHogTelemetry::GetMacAddressSafe()
     }
 }
 
+std::string PostHogTelemetry::Sha256Hex(const std::string& input)
+{
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(input.data()),
+           input.size(), digest);
+    char hex[SHA256_DIGEST_LENGTH * 2 + 1];
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++)
+        snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    return std::string(hex, SHA256_DIGEST_LENGTH * 2);
+}
+
+std::string PostHogTelemetry::GetDistinctIdFilePath()
+{
+#ifdef _WIN32
+    const char* appdata = std::getenv("APPDATA");
+    std::string base = appdata ? appdata : ".";
+    return base + "\\DataZoo\\telemetry_id";
+#else
+    const char* home = std::getenv("HOME");
+    std::string base = home ? home : ".";
+    return base + "/.config/datazoo/telemetry_id";
+#endif
+}
+
+std::string PostHogTelemetry::ReadDistinctIdFile()
+{
+    std::ifstream f(GetDistinctIdFilePath());
+    std::string id;
+    if (f >> id && id.size() <= 128) return id;
+    return "";
+}
+
+void PostHogTelemetry::WriteDistinctIdFile(const std::string& id)
+{
+    auto path = GetDistinctIdFilePath();
+    auto dir = path.substr(0, path.find_last_of("/\\"));
+#ifdef _WIN32
+    _mkdir(dir.c_str());
+#else
+    mkdir(dir.c_str(), 0700);
+#endif
+    std::ofstream f(path);
+    if (f) f << id;
+}
+
+std::string PostHogTelemetry::GetDistinctId()
+{
+    // C++11 static local: initialized once per process, thread-safe
+    static std::string cached = ComputeDistinctId();
+    return cached;
+}
+
+std::string PostHogTelemetry::ComputeDistinctId()
+{
+    // 1. Persistent storage — stable across process restarts
+    auto stored = ReadDistinctIdFile();
+    if (!stored.empty()) return stored;
+
+    // 2. Platform machine ID → SHA-256
+    auto machine_id = GetMachineId();
+    std::string id;
+    if (!machine_id.empty()) {
+        id = Sha256Hex(machine_id);
+    } else {
+        // 3. MAC address fallback → SHA-256
+        auto mac = GetMacAddressSafe();
+        id = Sha256Hex(mac);
+    }
+
+    // 4. Persist for future sessions
+    WriteDistinctIdFile(id);
+    return id;
+}
+
 #ifdef __linux__
+
+std::string PostHogTelemetry::GetMachineId()
+{
+    for (const char* path : {"/etc/machine-id", "/var/lib/dbus/machine-id"}) {
+        std::ifstream f(path);
+        std::string id;
+        if (f >> id && !id.empty()) return id;
+    }
+    return "";
+}
 
 std::string PostHogTelemetry::GetMacAddress()
 {
@@ -278,18 +392,18 @@ std::string PostHogTelemetry::GetMacAddress()
         return "00:00:00:00:00:00";
     }
 
-    std::ifstream file(StringUtil::Format("/sys/class/net/%s/address", device));
+    std::ifstream file(FormatStr("/sys/class/net/%s/address", device.c_str()));
 
     std::string mac_address;
     if (file >> mac_address) {
         return mac_address;
     }
 
-    throw std::runtime_error(StringUtil::Format("Could not read mac address of device %s", device));
+    throw std::runtime_error(FormatStr("Could not read mac address of device %s", device.c_str()));
 }
 
 bool PostHogTelemetry::IsPhysicalDevice(const std::string& device) {
-    std::string path = StringUtil::Format("/sys/class/net/%s/device/driver", device);
+    std::string path = FormatStr("/sys/class/net/%s/device/driver", device.c_str());
     return access(path.c_str(), F_OK) != -1;
 }
 
@@ -325,6 +439,20 @@ std::string PostHogTelemetry::FindFirstPhysicalDevice()
 
 #elif _WIN32
 
+std::string PostHogTelemetry::GetMachineId()
+{
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                      "SOFTWARE\\Microsoft\\Cryptography",
+                      0, KEY_READ | KEY_WOW64_64KEY, &hKey) != ERROR_SUCCESS)
+        return "";
+    char buf[256]; DWORD size = sizeof(buf);
+    LSTATUS res = RegQueryValueExA(hKey, "MachineGuid", nullptr,
+                                   nullptr, (LPBYTE)buf, &size);
+    RegCloseKey(hKey);
+    return (res == ERROR_SUCCESS) ? std::string(buf) : "";
+}
+
 std::string PostHogTelemetry::GetMacAddress()
 {
     ULONG out_buf_len = sizeof(IP_ADAPTER_INFO);
@@ -358,6 +486,21 @@ std::string PostHogTelemetry::GetMacAddress()
 
 #elif __APPLE__
 
+std::string PostHogTelemetry::GetMachineId()
+{
+    io_registry_entry_t entry = IORegistryEntryFromPath(
+        kIOMainPortDefault, "IOService:/");
+    if (!entry) return "";
+    CFStringRef uuid_ref = (CFStringRef)IORegistryEntryCreateCFProperty(
+        entry, CFSTR("IOPlatformUUID"), kCFAllocatorDefault, 0);
+    IOObjectRelease(entry);
+    if (!uuid_ref) return "";
+    char buf[64];
+    bool ok = CFStringGetCString(uuid_ref, buf, sizeof(buf), kCFStringEncodingUTF8);
+    CFRelease(uuid_ref);
+    return ok ? std::string(buf) : "";
+}
+
 std::string PostHogTelemetry::GetMacAddress()
 {
     struct ifaddrs *ifap, *ifa;
@@ -389,6 +532,8 @@ std::string PostHogTelemetry::GetMacAddress()
 }
 
 #else
+
+std::string PostHogTelemetry::GetMachineId() { return ""; }
 
 std::string PostHogTelemetry::GetMacAddress()
 {

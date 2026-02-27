@@ -1,55 +1,42 @@
 # PostHog Telemetry Unit Tests using Catch2
-# Supports both:
-# 1. Standalone build (CI) - DuckDB checked out to ${CMAKE_SOURCE_DIR}/duckdb
-# 2. Submodule in erpl - DuckDB at ${CMAKE_SOURCE_DIR}/duckdb (erpl's root)
-# 3. Build from erpl where CMAKE_SOURCE_DIR is duckdb itself
+# DuckDB source (headers) are fetched by the root CMakeLists.txt.
+# DuckDB prebuilt library (for duckdb_re2, exception types) is fetched here.
 
-# Note: OpenSSL is found and linked via posthog_telemetry target (PUBLIC dependency)
+include(FetchContent)
 
-# Find DuckDB headers - try multiple locations
-if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/catch")
-    # When CMAKE_SOURCE_DIR is the DuckDB directory itself (erpl build)
-    set(DUCKDB_THIRD_PARTY "${CMAKE_SOURCE_DIR}/third_party")
-    set(DUCKDB_SRC_INCLUDE "${CMAKE_SOURCE_DIR}/src/include")
-    message(STATUS "Found DuckDB at ${CMAKE_SOURCE_DIR}")
-elseif(EXISTS "${CMAKE_SOURCE_DIR}/duckdb/third_party/catch")
-    # Both standalone CI and erpl submodule use this path structure
-    set(DUCKDB_THIRD_PARTY "${CMAKE_SOURCE_DIR}/duckdb/third_party")
-    set(DUCKDB_SRC_INCLUDE "${CMAKE_SOURCE_DIR}/duckdb/src/include")
-    message(STATUS "Found DuckDB at ${CMAKE_SOURCE_DIR}/duckdb")
+# Platform-specific DuckDB prebuilt library
+if(WIN32)
+    set(DUCKDB_LIB_ZIP "libduckdb-windows-amd64.zip")
+elseif(APPLE)
+    set(DUCKDB_LIB_ZIP "libduckdb-osx-universal.zip")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(DUCKDB_LIB_ZIP "libduckdb-linux-aarch64.zip")
 else()
-    message(FATAL_ERROR "Cannot find DuckDB headers. Please ensure DuckDB is available at ${CMAKE_SOURCE_DIR}/duckdb or ${CMAKE_SOURCE_DIR}")
+    set(DUCKDB_LIB_ZIP "libduckdb-linux-amd64.zip")
 endif()
 
-# Find DuckDB library for standalone builds
-# DUCKDB_LIB_DIR can be set via cmake -DDUCKDB_LIB_DIR=path
-if(DUCKDB_LIB_DIR)
-    message(STATUS "Looking for DuckDB library in ${DUCKDB_LIB_DIR}")
-    find_library(DUCKDB_LIBRARY
-        NAMES duckdb libduckdb
-        PATHS ${DUCKDB_LIB_DIR}
-        NO_DEFAULT_PATH
-    )
-    if(DUCKDB_LIBRARY)
-        message(STATUS "Found DuckDB library: ${DUCKDB_LIBRARY}")
-    else()
-        message(FATAL_ERROR "DuckDB library not found in ${DUCKDB_LIB_DIR}")
-    endif()
+FetchContent_Declare(duckdb_prebuilt
+    URL https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/${DUCKDB_LIB_ZIP}
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_GetProperties(duckdb_prebuilt)
+if(NOT duckdb_prebuilt_POPULATED)
+    FetchContent_Populate(duckdb_prebuilt)
 endif()
 
-# Include directories (OpenSSL includes inherited from posthog_telemetry target)
+find_library(DUCKDB_LIBRARY
+    NAMES duckdb libduckdb
+    PATHS ${duckdb_prebuilt_SOURCE_DIR}
+    NO_DEFAULT_PATH
+    REQUIRED
+)
+message(STATUS "Found DuckDB library: ${DUCKDB_LIBRARY}")
+
+# Include directories (OpenSSL includes inherited via posthog_telemetry target)
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     ${DUCKDB_THIRD_PARTY}/catch
-    ${DUCKDB_THIRD_PARTY}/httplib
-    ${DUCKDB_THIRD_PARTY}
-    ${DUCKDB_SRC_INCLUDE}
 )
-
-# Also include DuckDB lib headers if provided
-if(DUCKDB_LIB_DIR)
-    include_directories(${DUCKDB_LIB_DIR})
-endif()
 
 set(TEST_SOURCES
     test_main.cpp
@@ -63,16 +50,21 @@ add_executable(posthog_telemetry_tests ${TEST_SOURCES})
 
 target_link_libraries(posthog_telemetry_tests
     posthog_telemetry
+    ${DUCKDB_LIBRARY}
 )
 
-# Link DuckDB library for standalone builds
-if(DUCKDB_LIBRARY)
-    target_link_libraries(posthog_telemetry_tests ${DUCKDB_LIBRARY})
+# On Windows, copy duckdb.dll next to the test binary at build time
+if(WIN32)
+    add_custom_command(TARGET posthog_telemetry_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${duckdb_prebuilt_SOURCE_DIR}/duckdb.dll"
+            "$<TARGET_FILE_DIR:posthog_telemetry_tests>"
+    )
 endif()
 
 # Platform-specific libraries
 if(WIN32)
-    target_link_libraries(posthog_telemetry_tests iphlpapi ws2_32)
+    target_link_libraries(posthog_telemetry_tests ws2_32)
 endif()
 
 # Enable threading

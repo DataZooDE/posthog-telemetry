@@ -1,8 +1,5 @@
 #pragma once
 
-#include "duckdb.hpp"
-#include "duckdb/common/string_util.hpp"
-
 #include <string>
 #include <vector>
 #include <map>
@@ -143,11 +140,21 @@ public:
     static std::string GetMacAddress();
     static std::string GetMacAddressSafe();
 
+    // Public static methods for stable distinct ID
+    static std::string GetDistinctId();
+    static std::string GetDistinctIdFilePath();  // for testing/debugging
+    static std::string GetMachineId();
+
 private:
     PostHogTelemetry();
     ~PostHogTelemetry();
 
     void EnsureQueueInitialized();
+
+    static std::string ComputeDistinctId();
+    static std::string Sha256Hex(const std::string& input);
+    static std::string ReadDistinctIdFile();
+    static void WriteDistinctIdFile(const std::string& id);
 
 #ifdef __linux__
     static bool IsPhysicalDevice(const std::string& device);
@@ -157,8 +164,8 @@ private:
     std::atomic<bool> _telemetry_enabled;
     std::string _api_key;
     std::string _extension_name;   // Default extension name for CaptureFunctionExecution
-    std::string _duckdb_version;   // Empty = use DuckDB::LibraryVersion()
-    std::string _duckdb_platform;  // Empty = use DuckDB::Platform()
+    std::string _duckdb_version;   // Empty = "unknown"
+    std::string _duckdb_platform;  // Empty = compile-time detected platform
     std::mutex _thread_lock;
     std::unique_ptr<TelemetryTaskQueue<PostHogEvent>> _queue;
 };

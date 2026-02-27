@@ -1,16 +1,28 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.14)
+cmake_policy(SET CMP0169 OLD)  # Allow FetchContent_Populate for header-only fetches
 
 project(posthog_telemetry)
 
 # OpenSSL is required for HTTPS support in httplib
 find_package(OpenSSL REQUIRED)
 
-# For standalone build (CI), find DuckDB headers
-# When used as submodule in a DuckDB extension, these paths come from parent project
-if(EXISTS "${CMAKE_SOURCE_DIR}/duckdb/src/include")
-    set(DUCKDB_SRC_INCLUDE "${CMAKE_SOURCE_DIR}/duckdb/src/include")
-    set(DUCKDB_THIRD_PARTY "${CMAKE_SOURCE_DIR}/duckdb/third_party")
-    message(STATUS "Found DuckDB headers at ${CMAKE_SOURCE_DIR}/duckdb")
+set(DUCKDB_VERSION "v1.4.3")
+
+# In standalone builds, fetch DuckDB source for headers (httplib, re2, duckdb.hpp, etc.)
+# In submodule builds (DuckDB extension), the parent project provides DuckDB headers.
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    include(FetchContent)
+    message(STATUS "Standalone build: fetching DuckDB ${DUCKDB_VERSION} source for headers")
+    FetchContent_Declare(duckdb_source
+        URL https://github.com/duckdb/duckdb/archive/refs/tags/${DUCKDB_VERSION}.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_GetProperties(duckdb_source)
+    if(NOT duckdb_source_POPULATED)
+        FetchContent_Populate(duckdb_source)
+    endif()
+    set(DUCKDB_SRC_INCLUDE "${duckdb_source_SOURCE_DIR}/src/include")
+    set(DUCKDB_THIRD_PARTY "${duckdb_source_SOURCE_DIR}/third_party")
 endif()
 
 # Define the library
@@ -29,8 +41,9 @@ target_include_directories(posthog_telemetry PRIVATE
     ${OPENSSL_INCLUDE_DIR}
 )
 
-# Add DuckDB paths if found (standalone build) - PRIVATE since not needed by consumers
-if(DUCKDB_SRC_INCLUDE)
+# Add DuckDB paths when available (standalone fetches above; submodule gets from parent)
+# PRIVATE: consumers only need telemetry.hpp, not DuckDB's internal headers
+if(DEFINED DUCKDB_SRC_INCLUDE)
     target_include_directories(posthog_telemetry PRIVATE
         ${DUCKDB_SRC_INCLUDE}
         ${DUCKDB_THIRD_PARTY}
@@ -41,8 +54,14 @@ endif()
 # Link OpenSSL libraries
 target_link_libraries(posthog_telemetry PUBLIC ${OPENSSL_LIBRARIES})
 
-if (WIN32)
+if(WIN32)
     target_link_libraries(posthog_telemetry PUBLIC iphlpapi)
+endif()
+
+if(APPLE)
+    target_link_libraries(posthog_telemetry PRIVATE
+        "-framework IOKit"
+        "-framework CoreFoundation")
 endif()
 
 # Standard C++17
