@@ -2,7 +2,6 @@
 #include "telemetry.hpp"
 
 #include <chrono>
-#include <fstream>
 #include <regex>
 #include <thread>
 #include <vector>
@@ -286,28 +285,6 @@ TEST_CASE("PostHogTelemetry - GetDistinctId returns valid 64-char hex", "[teleme
     REQUIRE(id.length() == 64);
     std::regex hex_regex("^[0-9a-f]{64}$");
     REQUIRE(std::regex_match(id, hex_regex));
-}
-
-TEST_CASE("PostHogTelemetry - GetDistinctIdFilePath returns valid path", "[telemetry]") {
-    std::string path = PostHogTelemetry::GetDistinctIdFilePath();
-
-    REQUIRE(!path.empty());
-    // datazoo on Unix, DataZoo on Windows
-    bool has_dir = path.find("datazoo") != std::string::npos
-                || path.find("DataZoo") != std::string::npos;
-    REQUIRE(has_dir);
-    REQUIRE(path.find("telemetry_id") != std::string::npos);
-}
-
-TEST_CASE("PostHogTelemetry - GetDistinctId file persists after call", "[telemetry]") {
-    std::string id = PostHogTelemetry::GetDistinctId();
-    std::string path = PostHogTelemetry::GetDistinctIdFilePath();
-
-    std::ifstream f(path);
-    REQUIRE(f.good());
-    std::string stored;
-    f >> stored;
-    REQUIRE(stored == id);
 }
 
 #ifdef __linux__

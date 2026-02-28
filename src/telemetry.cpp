@@ -13,7 +13,6 @@
 #ifdef __linux__
 #include <unistd.h>
 #include <dirent.h>
-#include <sys/stat.h>
 #endif
 
 #ifdef _WIN32
@@ -21,7 +20,6 @@
 #include <sstream>
 #include <winsock2.h>
 #include <iphlpapi.h>
-#include <direct.h>
 #ifndef _MSC_VER
 #define _MSC_VER 1936
 #endif
@@ -34,7 +32,6 @@
 #include <net/if.h>
 #include <net/if_dl.h>
 #include <cstring>
-#include <sys/stat.h>
 #include <IOKit/IOKitLib.h>
 #include <CoreFoundation/CoreFoundation.h>
 #endif
@@ -310,40 +307,6 @@ std::string PostHogTelemetry::Sha256Hex(const std::string& input)
     return std::string(hex, SHA256_DIGEST_LENGTH * 2);
 }
 
-std::string PostHogTelemetry::GetDistinctIdFilePath()
-{
-#ifdef _WIN32
-    const char* appdata = std::getenv("APPDATA");
-    std::string base = appdata ? appdata : ".";
-    return base + "\\DataZoo\\telemetry_id";
-#else
-    const char* home = std::getenv("HOME");
-    std::string base = home ? home : ".";
-    return base + "/.config/datazoo/telemetry_id";
-#endif
-}
-
-std::string PostHogTelemetry::ReadDistinctIdFile()
-{
-    std::ifstream f(GetDistinctIdFilePath());
-    std::string id;
-    if (f >> id && id.size() <= 128) return id;
-    return "";
-}
-
-void PostHogTelemetry::WriteDistinctIdFile(const std::string& id)
-{
-    auto path = GetDistinctIdFilePath();
-    auto dir = path.substr(0, path.find_last_of("/\\"));
-#ifdef _WIN32
-    _mkdir(dir.c_str());
-#else
-    mkdir(dir.c_str(), 0700);
-#endif
-    std::ofstream f(path);
-    if (f) f << id;
-}
-
 std::string PostHogTelemetry::GetDistinctId()
 {
     // C++11 static local: initialized once per process, thread-safe
@@ -353,24 +316,13 @@ std::string PostHogTelemetry::GetDistinctId()
 
 std::string PostHogTelemetry::ComputeDistinctId()
 {
-    // 1. Persistent storage — stable across process restarts
-    auto stored = ReadDistinctIdFile();
-    if (!stored.empty()) return stored;
-
-    // 2. Platform machine ID → SHA-256
+    // Platform machine ID → SHA-256 (OS-native IDs are stable by design)
     auto machine_id = GetMachineId();
-    std::string id;
     if (!machine_id.empty()) {
-        id = Sha256Hex(machine_id);
-    } else {
-        // 3. MAC address fallback → SHA-256
-        auto mac = GetMacAddressSafe();
-        id = Sha256Hex(mac);
+        return Sha256Hex(machine_id);
     }
-
-    // 4. Persist for future sessions
-    WriteDistinctIdFile(id);
-    return id;
+    // MAC address fallback → SHA-256
+    return Sha256Hex(GetMacAddressSafe());
 }
 
 #ifdef __linux__

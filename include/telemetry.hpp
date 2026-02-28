@@ -142,7 +142,6 @@ public:
 
     // Public static methods for stable distinct ID
     static std::string GetDistinctId();
-    static std::string GetDistinctIdFilePath();  // for testing/debugging
     static std::string GetMachineId();
 
 private:
@@ -153,8 +152,6 @@ private:
 
     static std::string ComputeDistinctId();
     static std::string Sha256Hex(const std::string& input);
-    static std::string ReadDistinctIdFile();
-    static void WriteDistinctIdFile(const std::string& id);
 
 #ifdef __linux__
     static bool IsPhysicalDevice(const std::string& device);
