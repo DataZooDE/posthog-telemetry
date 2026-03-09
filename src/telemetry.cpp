@@ -158,8 +158,12 @@ PostHogTelemetry::~PostHogTelemetry()
 
 PostHogTelemetry& PostHogTelemetry::Instance()
 {
-    static PostHogTelemetry instance;
-    return instance;
+    // Intentional leak: heap-allocated singleton is never destroyed.
+    // This avoids segfaults from static destruction order when the extension
+    // is loaded as a shared library (dlopen/dlclose) and OpenSSL or other
+    // globals are torn down before the singleton destructor runs.
+    static PostHogTelemetry* instance = new PostHogTelemetry();
+    return *instance;
 }
 
 void PostHogTelemetry::EnsureQueueInitialized()
