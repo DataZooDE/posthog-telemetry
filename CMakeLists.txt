@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.14)
-cmake_policy(SET CMP0169 OLD)  # Allow FetchContent_Populate for header-only fetches
+if(POLICY CMP0169)
+    cmake_policy(SET CMP0169 OLD)  # Allow FetchContent_Populate for header-only fetches
+endif()
 
 project(posthog_telemetry)
 
