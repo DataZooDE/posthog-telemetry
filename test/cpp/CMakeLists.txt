@@ -44,6 +44,7 @@ set(TEST_SOURCES
     test_queue.cpp
     test_telemetry.cpp
     test_error_handling.cpp
+    test_application_lifecycle.cpp
 )
 
 add_executable(posthog_telemetry_tests ${TEST_SOURCES})

@@ -199,6 +199,52 @@ void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
     _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
 }
 
+void PostHogTelemetry::CaptureApplicationStart(const std::string& app_name,
+                                               const std::string& app_version)
+{
+    if (!_telemetry_enabled) {
+        return;
+    }
+
+    PostHogEvent event = {
+        "application_start",
+        GetDistinctId(),
+        {
+            {"app_name", app_name},
+            {"app_version", app_version},
+            {"platform", GetDuckDBPlatform()},
+            {"duckdb_version", GetDuckDBVersion()}
+        }
+    };
+
+    auto api_key = this->_api_key;
+    EnsureQueueInitialized();
+    _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
+}
+
+void PostHogTelemetry::CaptureApplicationStop(const std::string& app_name,
+                                              const std::string& app_version)
+{
+    if (!_telemetry_enabled) {
+        return;
+    }
+
+    PostHogEvent event = {
+        "application_stop",
+        GetDistinctId(),
+        {
+            {"app_name", app_name},
+            {"app_version", app_version},
+            {"platform", GetDuckDBPlatform()},
+            {"duckdb_version", GetDuckDBVersion()}
+        }
+    };
+
+    auto api_key = this->_api_key;
+    EnsureQueueInitialized();
+    _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
+}
+
 // Overload 1: Explicit extension_name
 void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name,
                                                 const std::string& extension_name,

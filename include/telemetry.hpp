@@ -110,6 +110,12 @@ public:
     void CaptureExtensionLoad(const std::string& extension_name,
                               const std::string& extension_version = "0.1.0");
 
+    // Capture application lifecycle events
+    void CaptureApplicationStart(const std::string& app_name,
+                                  const std::string& app_version);
+    void CaptureApplicationStop(const std::string& app_name,
+                                 const std::string& app_version);
+
     // Capture function execution event - two overloads:
     // 1. Explicit extension_name
     void CaptureFunctionExecution(const std::string& function_name,
