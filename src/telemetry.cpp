@@ -92,18 +92,20 @@ void PostHogProcess(const std::string api_key, const PostHogEvent &event)
     try {
         auto cli = duckdb_httplib_openssl::Client("https://eu.posthog.com");
         if (cli.is_valid() == false) {
-            // Silently fail instead of throwing - telemetry should not break the application
             return;
         }
+        // Short timeouts so the worker thread doesn't outlive DuckDB's shutdown
+        // sequence.  In short-lived processes (smoke tests, unit tests) the SSL
+        // teardown in dlclose() context crashes if the thread is still mid-request
+        // when the extension is unloaded.  Best-effort telemetry is acceptable.
+        cli.set_connection_timeout(3);
+        cli.set_read_timeout(3);
+        cli.set_write_timeout(3);
         auto url = "/batch/";
         auto res = cli.Post(url, payload, "application/json");
-        if (res && res->status != 200) {
-            // Silently fail instead of throwing - telemetry should not break the application
-            return;
-        }
+        (void)res;
         cli.stop();
     } catch (...) {
-        // Silently fail instead of throwing - telemetry should not break the application
         return;
     }
 }
