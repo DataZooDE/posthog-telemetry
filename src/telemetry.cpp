@@ -92,18 +92,20 @@ void PostHogProcess(const std::string api_key, const PostHogEvent &event)
     try {
         auto cli = duckdb_httplib_openssl::Client("https://eu.posthog.com");
         if (cli.is_valid() == false) {
-            // Silently fail instead of throwing - telemetry should not break the application
             return;
         }
-        auto url = "/batch/";
-        auto res = cli.Post(url, payload, "application/json");
-        if (res && res->status != 200) {
-            // Silently fail instead of throwing - telemetry should not break the application
-            return;
-        }
+        // Short timeouts so the background thread finishes well before process
+        // teardown begins.  Without a bound, the default (300 s) keeps the thread
+        // alive during Python interpreter shutdown, where concurrent OpenSSL
+        // cleanup causes a SIGSEGV.
+        cli.set_connection_timeout(2, 0);
+        cli.set_read_timeout(3, 0);
+        cli.set_write_timeout(3, 0);
+        auto res = cli.Post("/batch/", payload, "application/json");
+        (void)res;
         cli.stop();
     } catch (...) {
-        // Silently fail instead of throwing - telemetry should not break the application
+        // Silently fail — telemetry must not break the application.
         return;
     }
 }
@@ -153,6 +155,52 @@ void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
             {"extension_name", extension_name},
             {"extension_version", extension_version},
             {"extension_platform", GetDuckDBPlatform()},
+            {"duckdb_version", GetDuckDBVersion()}
+        }
+    };
+
+    auto api_key = this->_api_key;
+    EnsureQueueInitialized();
+    _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
+}
+
+void PostHogTelemetry::CaptureApplicationStart(const std::string& app_name,
+                                               const std::string& app_version)
+{
+    if (!_telemetry_enabled) {
+        return;
+    }
+
+    PostHogEvent event = {
+        "application_start",
+        GetMacAddressSafe(),
+        {
+            {"app_name", app_name},
+            {"app_version", app_version},
+            {"platform", GetDuckDBPlatform()},
+            {"duckdb_version", GetDuckDBVersion()}
+        }
+    };
+
+    auto api_key = this->_api_key;
+    EnsureQueueInitialized();
+    _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
+}
+
+void PostHogTelemetry::CaptureApplicationStop(const std::string& app_name,
+                                              const std::string& app_version)
+{
+    if (!_telemetry_enabled) {
+        return;
+    }
+
+    PostHogEvent event = {
+        "application_stop",
+        GetMacAddressSafe(),
+        {
+            {"app_name", app_name},
+            {"app_version", app_version},
+            {"platform", GetDuckDBPlatform()},
             {"duckdb_version", GetDuckDBVersion()}
         }
     };

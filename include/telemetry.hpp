@@ -33,7 +33,7 @@ class TelemetryTaskQueue {
 public:
     using TaskFunction = std::function<void(T)>;
 
-    TelemetryTaskQueue() : stop_processing(false) {
+    TelemetryTaskQueue() : stop_processing(false), thread_done(false) {
         worker_thread = std::thread(&TelemetryTaskQueue::ProcessQueue, this);
     }
 
@@ -56,7 +56,21 @@ public:
         }
         condition.notify_all();
         if (worker_thread.joinable()) {
-            worker_thread.join();
+            // Try a timed join: poll every 50 ms for up to 5 s.
+            // The HTTP client has a 2+3 s timeout, so under normal conditions
+            // the thread finishes within that window.  If it still hasn't
+            // finished (e.g. OS is freezing sockets at shutdown), detach it —
+            // the OS will clean up when the process exits.
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!thread_done.load() &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (thread_done.load()) {
+                worker_thread.join();
+            } else {
+                worker_thread.detach();
+            }
         }
     }
 
@@ -74,6 +88,7 @@ private:
                 condition.wait(lock, [this] { return stop_processing || !tasks.empty(); });
 
                 if (stop_processing && tasks.empty()) {
+                    thread_done.store(true);
                     return;
                 }
 
@@ -98,6 +113,7 @@ private:
     std::condition_variable condition;
     std::thread worker_thread;
     bool stop_processing;
+    std::atomic<bool> thread_done;
 };
 
 class PostHogTelemetry {
@@ -112,6 +128,12 @@ public:
     // Also stores extension_name as default for CaptureFunctionExecution
     void CaptureExtensionLoad(const std::string& extension_name,
                               const std::string& extension_version = "0.1.0");
+
+    // Capture application lifecycle events
+    void CaptureApplicationStart(const std::string& app_name,
+                                  const std::string& app_version);
+    void CaptureApplicationStop(const std::string& app_name,
+                                 const std::string& app_version);
 
     // Capture function execution event - two overloads:
     // 1. Explicit extension_name
