@@ -89,25 +89,10 @@ void PostHogProcess(const std::string api_key, const PostHogEvent &event)
     )", api_key, event.event_name, event.distinct_id,
         event.GetPropertiesJson(), event.GetNowISO8601());
 
-    try {
-        auto cli = duckdb_httplib_openssl::Client("https://eu.posthog.com");
-        if (cli.is_valid() == false) {
-            return;
-        }
-        // Short timeouts so the background thread finishes well before process
-        // teardown begins.  Without a bound, the default (300 s) keeps the thread
-        // alive during Python interpreter shutdown, where concurrent OpenSSL
-        // cleanup causes a SIGSEGV.
-        cli.set_connection_timeout(2, 0);
-        cli.set_read_timeout(3, 0);
-        cli.set_write_timeout(3, 0);
-        auto res = cli.Post("/batch/", payload, "application/json");
-        (void)res;
-        cli.stop();
-    } catch (...) {
-        // Silently fail — telemetry must not break the application.
-        return;
-    }
+    duckdb_httplib_openssl::SSLClient cli("eu.posthog.com", 443);
+    cli.set_connection_timeout(2, 0);
+    cli.set_read_timeout(6, 0);
+    (void)cli.Post("/batch", payload, "application/json");
 }
 
 // PostHogTelemetry Implementation --------------------------------------------------------
@@ -122,6 +107,14 @@ PostHogTelemetry::~PostHogTelemetry()
 {
     if (_queue) {
         _queue->Stop();
+    }
+}
+
+void PostHogTelemetry::Shutdown()
+{
+    if (_queue) {
+        _queue->Stop();
+        _queue.reset();  // null so destructor's Stop() is a no-op
     }
 }
 

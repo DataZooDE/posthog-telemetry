@@ -56,22 +56,11 @@ public:
         }
         condition.notify_all();
         if (worker_thread.joinable()) {
-            // Try a timed join: poll every 50 ms for up to 10 s.
-            // ProcessQueue exits after the current task finishes (any remaining
-            // tasks are dropped) so the worst-case wait equals one HTTP call:
-            // 2 s connect + 3 s read + 3 s write = 8 s.  10 s gives 2 s margin.
-            // If the deadline is still missed (OS-level socket stall), detach —
-            // the OS cleans up when the process exits.
-            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            while (!thread_done.load() &&
-                   std::chrono::steady_clock::now() < deadline) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
-            if (thread_done.load()) {
-                worker_thread.join();
-            } else {
-                worker_thread.detach();
-            }
+            // Always join — never detach. The background thread exits after its
+            // current HTTP call completes; with a 2 s connect timeout the wait
+            // is bounded. Detaching would let the thread keep running after
+            // TelemetryTaskQueue is destroyed, causing use-after-free crashes.
+            worker_thread.join();
         }
     }
 
@@ -155,6 +144,9 @@ public:
 
     bool IsEnabled();
     void SetEnabled(bool enabled);
+
+    // Stop the background queue immediately; idempotent. Safe to call before process exit.
+    void Shutdown();
 
     std::string GetAPIKey();
     void SetAPIKey(std::string new_key);
