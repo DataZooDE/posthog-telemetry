@@ -56,12 +56,13 @@ public:
         }
         condition.notify_all();
         if (worker_thread.joinable()) {
-            // Try a timed join: poll every 50 ms for up to 5 s.
-            // The HTTP client has a 2+3 s timeout, so under normal conditions
-            // the thread finishes within that window.  If it still hasn't
-            // finished (e.g. OS is freezing sockets at shutdown), detach it —
-            // the OS will clean up when the process exits.
-            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            // Try a timed join: poll every 50 ms for up to 10 s.
+            // ProcessQueue exits after the current task finishes (any remaining
+            // tasks are dropped) so the worst-case wait equals one HTTP call:
+            // 2 s connect + 3 s read + 3 s write = 8 s.  10 s gives 2 s margin.
+            // If the deadline is still missed (OS-level socket stall), detach —
+            // the OS cleans up when the process exits.
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             while (!thread_done.load() &&
                    std::chrono::steady_clock::now() < deadline) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -87,7 +88,10 @@ private:
                 std::unique_lock<std::mutex> lock(queue_mutex);
                 condition.wait(lock, [this] { return stop_processing || !tasks.empty(); });
 
-                if (stop_processing && tasks.empty()) {
+                if (stop_processing) {
+                    // Exit after the current task finishes — remaining queued
+                    // tasks are dropped so Stop() never waits more than one
+                    // HTTP call duration (≤ 8 s with our connection/read timeouts).
                     thread_done.store(true);
                     return;
                 }
