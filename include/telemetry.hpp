@@ -154,7 +154,10 @@ private:
     PostHogTelemetry();
     ~PostHogTelemetry();
 
+    static void ShutdownAtExit();
+    void Shutdown();
     void EnsureQueueInitialized();
+    void EnqueueTelemetryEvent(const PostHogEvent &event);
 
     static std::string ComputeDistinctId();
     static std::string Sha256Hex(const std::string& input);
@@ -165,6 +168,7 @@ private:
 #endif
 
     std::atomic<bool> _telemetry_enabled;
+    bool _shutdown_requested;
     std::string _api_key;
     std::string _extension_name;   // Default extension name for CaptureFunctionExecution
     std::string _duckdb_version;   // Empty = "unknown"

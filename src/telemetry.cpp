@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <openssl/ssl.h>
+
 #ifdef __linux__
 #include <unistd.h>
 #include <dirent.h>
@@ -147,31 +149,64 @@ void PostHogProcess(const std::string api_key, const PostHogEvent &event)
 
 PostHogTelemetry::PostHogTelemetry()
     : _telemetry_enabled(true),
+      _shutdown_requested(false),
       _api_key("phc_t3wwRLtpyEmLHYaZCSszG0MqVr74J6wnCrj9D41zk2t"),
       _queue(nullptr)
 {  }
 
 PostHogTelemetry::~PostHogTelemetry()
 {
-    if (_queue) {
-        _queue->Stop();
+    Shutdown();
+}
+
+void PostHogTelemetry::Shutdown()
+{
+    std::unique_ptr<TelemetryTaskQueue<PostHogEvent>> queue;
+    {
+        std::lock_guard<std::mutex> t(_thread_lock);
+        _shutdown_requested = true;
+        _telemetry_enabled = false;
+        queue = std::move(_queue);
+    }
+    if (queue) {
+        queue->Stop();
     }
 }
 
 PostHogTelemetry& PostHogTelemetry::Instance()
 {
-    // Intentional leak: heap-allocated singleton is never destroyed.
-    // This avoids segfaults from static destruction order when the extension
-    // is loaded as a shared library (dlopen/dlclose) and OpenSSL or other
-    // globals are torn down before the singleton destructor runs.
-    static PostHogTelemetry* instance = new PostHogTelemetry();
+    static PostHogTelemetry* instance = []() {
+        OPENSSL_init_ssl(0, nullptr);
+        auto *telemetry = new PostHogTelemetry();
+        std::atexit(&PostHogTelemetry::ShutdownAtExit);
+        return telemetry;
+    }();
     return *instance;
+}
+
+void PostHogTelemetry::ShutdownAtExit()
+{
+    Instance().Shutdown();
 }
 
 void PostHogTelemetry::EnsureQueueInitialized()
 {
     if (!_queue) {
         _queue = std::make_unique<TelemetryTaskQueue<PostHogEvent>>();
+    }
+}
+
+void PostHogTelemetry::EnqueueTelemetryEvent(const PostHogEvent &event)
+{
+    std::string api_key;
+    {
+        std::lock_guard<std::mutex> t(_thread_lock);
+        if (_shutdown_requested || !_telemetry_enabled) {
+            return;
+        }
+        api_key = _api_key;
+        EnsureQueueInitialized();
+        _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
     }
 }
 
@@ -196,9 +231,7 @@ void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
         }
     };
 
-    auto api_key = this->_api_key;
-    EnsureQueueInitialized();
-    _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
+    EnqueueTelemetryEvent(event);
 }
 
 void PostHogTelemetry::CaptureApplicationStart(const std::string& app_name,
@@ -219,9 +252,7 @@ void PostHogTelemetry::CaptureApplicationStart(const std::string& app_name,
         }
     };
 
-    auto api_key = this->_api_key;
-    EnsureQueueInitialized();
-    _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
+    EnqueueTelemetryEvent(event);
 }
 
 void PostHogTelemetry::CaptureApplicationStop(const std::string& app_name,
@@ -242,9 +273,7 @@ void PostHogTelemetry::CaptureApplicationStop(const std::string& app_name,
         }
     };
 
-    auto api_key = this->_api_key;
-    EnsureQueueInitialized();
-    _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
+    EnqueueTelemetryEvent(event);
 }
 
 // Overload 1: Explicit extension_name
@@ -267,9 +296,7 @@ void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name
             {"duckdb_version", GetDuckDBVersion()}
         }
     };
-    auto api_key = this->_api_key;
-    EnsureQueueInitialized();
-    _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
+    EnqueueTelemetryEvent(event);
 }
 
 // Overload 2: Uses stored default extension_name
