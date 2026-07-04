@@ -1,5 +1,11 @@
 #pragma once
 
+// Telemetry is compiled in by default. Consumers whose build cannot provide
+// the real implementation (e.g. MinGW lanes where vcpkg cannot build OpenSSL)
+// define POSTHOG_TELEMETRY_DISABLED on the TUs that call telemetry: every call
+// then compiles to an inline no-op and telemetry.cpp must not be compiled.
+#if !defined(POSTHOG_TELEMETRY_DISABLED)
+
 #include <string>
 #include <vector>
 #include <map>
@@ -188,3 +194,51 @@ private:
 };
 
 } // namespace duckdb
+
+#else // POSTHOG_TELEMETRY_DISABLED
+
+// No-op stubs: every telemetry call compiles to nothing. Keep this in sync
+// with the real public API above.
+#include <string>
+
+namespace duckdb {
+
+class PostHogTelemetry {
+public:
+    static PostHogTelemetry& Instance() {
+        static PostHogTelemetry instance;
+        return instance;
+    }
+
+    PostHogTelemetry(const PostHogTelemetry&) = delete;
+    PostHogTelemetry& operator=(const PostHogTelemetry&) = delete;
+
+    void CaptureExtensionLoad(const std::string&, const std::string& = "0.1.0") {}
+    void CaptureApplicationStart(const std::string&, const std::string&) {}
+    void CaptureApplicationStop(const std::string&, const std::string&) {}
+    void CaptureFunctionExecution(const std::string&, const std::string&, const std::string&) {}
+    void CaptureFunctionExecution(const std::string&, const std::string& = "0.1.0") {}
+    void SetExtensionName(const std::string&) {}
+    std::string GetExtensionName() { return ""; }
+    bool IsEnabled() { return false; }
+    void SetEnabled(bool) {}
+    std::string GetAPIKey() { return ""; }
+    void SetAPIKey(std::string) {}
+    void SetDuckDBVersion(const std::string&) {}
+    void SetDuckDBPlatform(const std::string&) {}
+    std::string GetDuckDBVersion() { return ""; }
+    std::string GetDuckDBPlatform() { return ""; }
+
+    static std::string GetMacAddress() { return ""; }
+    static std::string GetMacAddressSafe() { return ""; }
+    static std::string GetDistinctId() { return ""; }
+    static std::string GetMachineId() { return ""; }
+
+private:
+    PostHogTelemetry() = default;
+    ~PostHogTelemetry() = default;
+};
+
+} // namespace duckdb
+
+#endif // POSTHOG_TELEMETRY_DISABLED
