@@ -177,6 +177,13 @@ PostHogTelemetry& PostHogTelemetry::Instance()
 {
     static PostHogTelemetry* instance = []() {
         OPENSSL_init_ssl(0, nullptr);
+        // Construct (and discard) a client once so httplib's function-local
+        // statics — notably the URL-parsing regex in the Client constructor —
+        // are initialized before the atexit handler below is registered.
+        // Statics initialized later than the handler are destroyed before it
+        // runs, and an in-flight POST at process exit would touch them dead.
+        // No network I/O happens here; the constructor only parses the URL.
+        { duckdb_httplib_openssl::Client warmup("https://eu.posthog.com"); }
         auto *telemetry = new PostHogTelemetry();
         std::atexit(&PostHogTelemetry::ShutdownAtExit);
         return telemetry;

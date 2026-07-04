@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <thread>
 #include <vector>
 
@@ -201,8 +202,12 @@ TEST_CASE("TelemetryTaskQueue - High throughput stress test", "[queue][stress]")
             }, i);
         }
 
-        // Wait for processing
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        // Wait for processing; Stop() discards leftovers, so poll rather
+        // than rely on a fixed sleep being long enough.
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (counter < num_tasks && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
     }
 
     REQUIRE(counter == num_tasks);
@@ -237,6 +242,46 @@ TEST_CASE("TelemetryTaskQueue - Task modifying external state", "[queue]") {
     REQUIRE(log[0] == "first");
     REQUIRE(log[1] == "second");
     REQUIRE(log[2] == "third");
+}
+
+TEST_CASE("TelemetryTaskQueue - Stop discards pending tasks without executing them", "[queue]") {
+    std::atomic<int> executed{0};
+    std::promise<void> task_started;
+    std::promise<void> release_task;
+    auto release_future = release_task.get_future().share();
+
+    TelemetryTaskQueue<int> queue;
+
+    // Block the worker inside the first task so the rest stay queued.
+    queue.EnqueueTask([&executed, &task_started, release_future](int) {
+        executed++;
+        task_started.set_value();
+        release_future.wait();
+    }, 0);
+    task_started.get_future().wait();
+
+    for (int i = 0; i < 50; i++) {
+        queue.EnqueueTask([&executed](int) {
+            executed++;
+        }, i);
+    }
+
+    // Stop() must discard the 50 queued tasks even while the worker is busy;
+    // it blocks in join() until the in-flight task is released.
+    std::thread stopper([&queue]() {
+        queue.Stop();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    release_task.set_value();
+    stopper.join();
+
+    REQUIRE(executed == 1);
+
+    // Enqueue after stop is a no-op, not a crash.
+    queue.EnqueueTask([&executed](int) {
+        executed++;
+    }, 0);
+    REQUIRE(executed == 1);
 }
 
 TEST_CASE("TelemetryTaskQueue - Double stop is safe", "[queue]") {

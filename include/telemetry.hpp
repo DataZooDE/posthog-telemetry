@@ -41,6 +41,9 @@ public:
     void EnqueueTask(TaskFunction task, T data) {
         {
             std::lock_guard<std::mutex> lock(queue_mutex);
+            if (stop_processing) {
+                return;
+            }
             tasks.push({task, data});
         }
         condition.notify_one();
@@ -50,6 +53,11 @@ public:
         {
             std::lock_guard<std::mutex> lock(queue_mutex);
             stop_processing = true;
+            // Discard pending tasks instead of draining them: Stop() runs from
+            // the atexit shutdown handler, and executing queued tasks there
+            // starts new HTTPS requests whose httplib function-local statics
+            // (URL-parsing regexes) may already be destroyed at that point.
+            std::queue<QueueItem>().swap(tasks);
         }
         condition.notify_all();
         if (worker_thread.joinable()) {
@@ -70,7 +78,9 @@ private:
                 std::unique_lock<std::mutex> lock(queue_mutex);
                 condition.wait(lock, [this] { return stop_processing || !tasks.empty(); });
 
-                if (stop_processing && tasks.empty()) {
+                // Exit as soon as a stop is requested; Stop() has already
+                // discarded whatever was still queued.
+                if (stop_processing) {
                     return;
                 }
 
