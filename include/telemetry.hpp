@@ -205,6 +205,19 @@ class PostHogTelemetry {
 public:
     static PostHogTelemetry& Instance();
 
+    // Deterministically stop the background worker (join it) and drop buffered
+    // work. Call this before unloading a module that statically links this
+    // library (e.g. `dlclose` of a DuckDB extension) so no worker thread is left
+    // running in about-to-be-unmapped code. Idempotent and terminal: telemetry
+    // stays disabled afterwards.
+    //
+    // NOTE: the atexit handler registered on first use cannot be unregistered
+    // (C++ has no such API); if the module IS unloaded before process exit, load
+    // it RTLD_NODELETE (keep it mapped) so that handler doesn't dangle. Hosts
+    // that keep the module loaded for the whole process (the common DuckDB case)
+    // don't need Cleanup() at all — the atexit path already handles exit safely.
+    static void Cleanup();
+
     // Delete copy constructor and assignment operator
     PostHogTelemetry(const PostHogTelemetry&) = delete;
     PostHogTelemetry& operator=(const PostHogTelemetry&) = delete;
@@ -303,6 +316,10 @@ public:
     // Testing seam: clear the cached is_ci detection so a test can re-fake the
     // environment (CI status is cached once in production).
     static void ResetDetectionCacheForTesting();
+
+    // Testing seam: undo a Cleanup()/Shutdown() so the shared singleton is
+    // usable again by later test cases.
+    void ResetShutdownForTesting();
 
     // DuckDB version and platform (for telemetry)
     void SetDuckDBVersion(const std::string& version);
@@ -463,6 +480,8 @@ public:
         static PostHogTelemetry instance;
         return instance;
     }
+
+    static void Cleanup() {}
 
     PostHogTelemetry(const PostHogTelemetry&) = delete;
     PostHogTelemetry& operator=(const PostHogTelemetry&) = delete;

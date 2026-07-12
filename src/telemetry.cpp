@@ -440,6 +440,22 @@ void PostHogTelemetry::ShutdownAtExit()
     Instance().Shutdown();
 }
 
+void PostHogTelemetry::Cleanup()
+{
+    // Same teardown as the atexit path: stop+join the worker and drop buffered
+    // work. Safe to call before dlclose and idempotent (Shutdown re-runs are a
+    // no-op — the queue is already moved out).
+    Instance().Shutdown();
+}
+
+void PostHogTelemetry::ResetShutdownForTesting()
+{
+    std::lock_guard<std::mutex> t(_thread_lock);
+    _shutdown_requested = false;
+    _telemetry_enabled = true;
+    // _queue was moved out by Shutdown(); the next capture lazily recreates it.
+}
+
 // Must be called under _thread_lock. Starts the background worker queue lazily.
 void PostHogTelemetry::EnsureQueueInitialized()
 {

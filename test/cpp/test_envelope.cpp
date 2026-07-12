@@ -209,16 +209,18 @@ TEST_CASE("Coalescing - a burst collapses to few POSTs, no loss", "[batch][coale
     std::atomic<int> events{0};
     std::promise<void> release;
     auto fut = release.get_future().share();
-    std::atomic<bool> first{true};
+    std::atomic<bool> block_armed{false};   // disarmed during the clearing flush
     t.SetTransportForTesting(
         [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
-            if (first.exchange(false)) fut.wait();   // block the first POST so a burst accumulates
+            if (block_armed.exchange(false)) fut.wait();   // block the first burst POST
             posts++;
             events += static_cast<int>(evs.size());
         });
 
+    // Clear any prior-test leftovers WITHOUT blocking, then reset counters and
+    // arm the block only for the burst so nothing extra is counted.
     t.Flush();
-    posts = 0; events = 0; first = true;
+    posts = 0; events = 0; block_armed = true;
 
     t.SetAutoFlushEnabledForTesting(true);
     const int N = 50;
@@ -952,6 +954,32 @@ TEST_CASE("Aggregation - function events carry extension_name", "[aggregation]")
         }
     }
     REQUIRE(ok);
+}
+
+TEST_CASE("Cleanup - stops the worker, is idempotent, disables capture", "[lifecycle]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+
+    std::atomic<int> sent{0};
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            sent += static_cast<int>(evs.size());
+        });
+
+    // Cleanup joins the worker and drops buffered work; safe to call twice.
+    REQUIRE_NOTHROW(PostHogTelemetry::Cleanup());
+    REQUIRE_NOTHROW(PostHogTelemetry::Cleanup());
+
+    // After Cleanup, captures are no-ops (shutdown requested) and nothing sends.
+    sent = 0;
+    t.CaptureFeature("after_cleanup", {});
+    t.Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    REQUIRE(sent == 0);
+
+    // Restore the shared singleton for subsequent test cases.
+    t.ResetShutdownForTesting();
+    t.SetTransportForTesting({});
 }
 
 TEST_CASE("Session id - stable within a process, UUID-shaped", "[envelope][session]") {

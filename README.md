@@ -106,7 +106,8 @@ void AssociateGroup(const std::string& type, const std::string& key,
                     PropertyMap props = {});
 
 // --- lifecycle ---
-void Flush();   // synchronously drain buffered events before exit (bounded)
+void Flush();          // synchronously drain buffered events before exit (bounded)
+static void Cleanup(); // stop+join the worker before unloading a module (dlclose)
 ```
 
 `PropertyMap` is `std::map<std::string, PropertyValue>`; `PropertyValue`
@@ -131,6 +132,18 @@ because aggregation changes its shape; migrate `function_execution` queries to
 3. Emit `CaptureFeature(...)` / `CaptureError(...)` for your top capabilities and
    failure modes; associate an `account` group for enterprise builds.
 4. Call `Flush()` before exit in short-lived processes/CLIs.
+
+### Unloading the module (`dlclose`)
+
+If the library is statically linked into a module that may be **unloaded before
+the process exits** (e.g. a DuckDB extension that gets `dlclose`d), call
+`PostHogTelemetry::Cleanup()` before unload. It stops and joins the background
+worker so no thread is left executing in about-to-be-unmapped code. Because C++
+cannot unregister the `atexit` handler that the library installs on first use,
+also load such a module `RTLD_NODELETE` (so it stays mapped) to keep that handler
+valid at process exit. Hosts that keep the module loaded for the whole process
+lifetime — the common DuckDB case — need neither: the `atexit` path already tears
+down safely at exit.
 
 > **Host default:** stays `https://eu.posthog.com`. Flip to
 > `https://eu.i.posthog.com` (PostHog's EU *ingestion* host) via `SetHost(...)`
