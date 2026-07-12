@@ -403,9 +403,9 @@ TEST_CASE("SetHost - host is configurable and reaches the transport", "[host]") 
     t.Flush();
     REQUIRE(seen_host == "https://custom.example.com");
 
-    // Default stays eu.posthog.com until eu.i.posthog.com is verified.
+    // Default is PostHog's EU ingestion host.
     t.SetHost("");
-    REQUIRE(t.GetHost() == std::string("https://eu.posthog.com"));
+    REQUIRE(t.GetHost() == std::string("https://eu.i.posthog.com"));
 
     t.SetTransportForTesting({});
 }

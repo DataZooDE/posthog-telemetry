@@ -35,7 +35,7 @@ TEST_CASE("Error Handling - PostHogProcess with empty API key", "[error]") {
 }
 
 TEST_CASE("Error Handling - Network failure simulation (invalid endpoint)", "[error]") {
-    // The PostHogProcess function sends to eu.posthog.com
+    // The PostHogProcess function sends to eu.i.posthog.com
     // If network is unavailable, it should fail silently
     PostHogEvent event = {
         "test_event",
