@@ -3,8 +3,10 @@
 #include "catch.hpp"
 #include "telemetry.hpp"
 
+#include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 using namespace duckdb;
 
@@ -142,6 +144,72 @@ TEST_CASE("Cardinality guard - long property values are clamped", "[envelope][ca
 
     std::string json = ev.GetPropertiesJson();
     REQUIRE_FALSE(Contains(json, huge));
+}
+
+TEST_CASE("Aggregation - 1e6 calls collapse to O(#functions) events", "[aggregation]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+    t.SetSampling(1.0);
+    t.DrainFunctionAggregatesForTesting();  // clear any prior state
+
+    const int kFns = 5;
+    const int kCalls = 1000000;
+    std::vector<std::string> names;
+    for (int i = 0; i < kFns; i++) {
+        names.push_back("fn_" + std::to_string(i));
+    }
+    for (int i = 0; i < kCalls; i++) {
+        t.RecordFunctionCall(names[i % kFns]);
+    }
+
+    auto events = t.DrainFunctionAggregatesForTesting();
+    REQUIRE(events.size() == static_cast<size_t>(kFns));  // NOT 1e6 events
+
+    uint64_t total = 0;
+    for (auto& ev : events) {
+        REQUIRE(ev.event_name == "function_executed");
+        const auto& cc = ev.properties.at("call_count");
+        REQUIRE(cc.kind == PropertyValue::Kind::Int);  // numeric, not quoted
+        total += static_cast<uint64_t>(cc.i);
+        REQUIRE(ev.properties.count("function_name") == 1);
+        REQUIRE(ev.properties.count("duration_ms_p50") == 1);
+    }
+    REQUIRE(total == static_cast<uint64_t>(kCalls));  // no calls lost
+}
+
+TEST_CASE("Aggregation - duration_ms_p50 reflects recorded durations", "[aggregation]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+    t.SetSampling(1.0);
+    t.DrainFunctionAggregatesForTesting();
+
+    for (int i = 0; i < 9; i++) {
+        t.RecordFunctionCall("timed", 10.0);
+    }
+    auto events = t.DrainFunctionAggregatesForTesting();
+    REQUIRE(events.size() == 1);
+    const auto& p50 = events[0].properties.at("duration_ms_p50");
+    REQUIRE(p50.kind == PropertyValue::Kind::Double);
+    REQUIRE(p50.d == Approx(10.0));
+}
+
+TEST_CASE("Aggregation - sampling decimates and stamps sample_rate", "[aggregation][sampling]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+    t.DrainFunctionAggregatesForTesting();
+
+    t.SetSampling(0.1);  // ~1 in 10
+    for (int i = 0; i < 1000; i++) {
+        t.RecordFunctionCall("hot");
+    }
+    auto events = t.DrainFunctionAggregatesForTesting();
+    REQUIRE(events.size() == 1);
+    const auto& cc = events[0].properties.at("call_count");
+    REQUIRE(cc.i >= 50);
+    REQUIRE(cc.i <= 150);                            // decimated, not 1000
+    REQUIRE(events[0].properties.count("sample_rate") == 1);
+
+    t.SetSampling(1.0);  // restore
 }
 
 TEST_CASE("Session id - stable within a process, UUID-shaped", "[envelope][session]") {

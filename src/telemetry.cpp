@@ -532,34 +532,112 @@ void PostHogTelemetry::CaptureApplicationStop(const std::string& app_name,
     EnqueueTelemetryEvent(event);
 }
 
-// Overload 1: Explicit extension_name
+// Overload 1: Explicit extension_name.
+// Deprecated shim: per-call function events were a firehose. Route into the
+// aggregator; one aggregated `function_executed` event per function is emitted
+// on flush (see FlushFunctionAggregates). extension_name/function_version are
+// no longer carried by the aggregated event.
 void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name,
-                                                const std::string& extension_name,
-                                                const std::string& function_version)
+                                                const std::string& /*extension_name*/,
+                                                const std::string& /*function_version*/)
+{
+    RecordFunctionCall(function_name);
+}
+
+// Overload 2: Uses stored default extension_name
+void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name,
+                                                const std::string& /*function_version*/)
+{
+    RecordFunctionCall(function_name);
+}
+
+void PostHogTelemetry::SetSampling(double rate)
+{
+    if (rate < 0.0) rate = 0.0;
+    if (rate > 1.0) rate = 1.0;
+    std::lock_guard<std::mutex> lock(_agg_lock);
+    _sampling_rate = rate;
+}
+
+void PostHogTelemetry::RecordFunctionCall(const std::string& function_name,
+                                          double duration_ms)
 {
     if (!_telemetry_enabled) {
         return;
     }
 
-    PostHogEvent event = {
-        "function_execution",
-        GetDistinctId(),
-        {
-            {"function_name", function_name},
-            {"function_version", function_version},
-            {"extension_name", extension_name},
-            {"extension_platform", GetDuckDBPlatform()},
-            {"duckdb_version", GetDuckDBVersion()}
+    std::lock_guard<std::mutex> lock(_agg_lock);
+
+    // Client-side decimation: record 1 of every `stride` calls when sampling.
+    if (_sampling_rate < 1.0) {
+        if (_sampling_rate <= 0.0) {
+            return;
         }
-    };
-    EnqueueTelemetryEvent(event);
+        uint64_t stride = static_cast<uint64_t>(1.0 / _sampling_rate + 0.5);
+        if (stride < 1) stride = 1;
+        bool record = (_sample_counter % stride) == 0;
+        _sample_counter++;
+        if (!record) {
+            return;
+        }
+    }
+
+    static constexpr size_t kMaxDurationSamples = 256;
+    auto& st = _function_stats[function_name];
+    st.count++;
+    if (st.duration_samples.size() < kMaxDurationSamples) {
+        st.duration_samples.push_back(duration_ms);
+    } else {
+        st.duration_samples[st.count % kMaxDurationSamples] = duration_ms;
+    }
 }
 
-// Overload 2: Uses stored default extension_name
-void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name,
-                                                const std::string& function_version)
+static double MedianOf(std::vector<double> v)
 {
-    CaptureFunctionExecution(function_name, GetExtensionName(), function_version);
+    if (v.empty()) {
+        return 0.0;
+    }
+    std::sort(v.begin(), v.end());
+    size_t n = v.size();
+    return (n % 2) ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0;
+}
+
+std::vector<PostHogEvent> PostHogTelemetry::BuildFunctionAggregateEvents()
+{
+    std::map<std::string, FunctionStat> snapshot;
+    double sample_rate;
+    {
+        std::lock_guard<std::mutex> lock(_agg_lock);
+        snapshot.swap(_function_stats);
+        sample_rate = _sampling_rate;
+    }
+
+    std::string distinct = GetDistinctId();
+    std::vector<PostHogEvent> events;
+    events.reserve(snapshot.size());
+    for (auto& kv : snapshot) {
+        PropertyMap props;
+        props["function_name"]   = kv.first;
+        props["call_count"]      = static_cast<int64_t>(kv.second.count);
+        props["duration_ms_p50"] = MedianOf(kv.second.duration_samples);
+        if (sample_rate < 1.0) {
+            props["sample_rate"] = sample_rate;
+        }
+        events.push_back(PostHogEvent{"function_executed", distinct, std::move(props)});
+    }
+    return events;
+}
+
+void PostHogTelemetry::FlushFunctionAggregates()
+{
+    for (auto& ev : BuildFunctionAggregateEvents()) {
+        EnqueueTelemetryEvent(ev);
+    }
+}
+
+std::vector<PostHogEvent> PostHogTelemetry::DrainFunctionAggregatesForTesting()
+{
+    return BuildFunctionAggregateEvents();
 }
 
 

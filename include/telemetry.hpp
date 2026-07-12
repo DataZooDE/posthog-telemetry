@@ -6,6 +6,7 @@
 // then compiles to an inline no-op and telemetry.cpp must not be compiled.
 #if !defined(POSTHOG_TELEMETRY_DISABLED)
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <map>
@@ -176,6 +177,17 @@ public:
     void CaptureFunctionExecution(const std::string& function_name,
                                   const std::string& function_version = "0.1.0");
 
+    // Record a single function call into the in-process aggregator. Millions of
+    // calls collapse into one `function_executed` event per function (carrying
+    // call_count and duration_ms_p50), flushed on Flush()/session end — this is
+    // what tames the per-call firehose. Cheap and lock-guarded.
+    void RecordFunctionCall(const std::string& function_name,
+                            double duration_ms = 0);
+
+    // Client-side sampling for still-hot events: rate in [0,1]. Recorded events
+    // are decimated and stamped with sample_rate so counts scale back up.
+    void SetSampling(double rate);
+
     // Set/get default extension name for the instance
     void SetExtensionName(const std::string& name);
     std::string GetExtensionName();
@@ -210,6 +222,10 @@ public:
     PostHogEvent BuildEventForTesting(const std::string& event_name,
                                       PropertyMap props = {});
 
+    // Testing seam: drain the function aggregator and return the raw (un-sent)
+    // `function_executed` events it would produce. Clears the aggregator.
+    std::vector<PostHogEvent> DrainFunctionAggregatesForTesting();
+
 private:
     PostHogTelemetry();
     ~PostHogTelemetry();
@@ -232,6 +248,16 @@ private:
     static const std::string& DetectOs();
     static const std::string& DetectArch();
 
+    // Function-call aggregation ------------------------------------------------
+    struct FunctionStat {
+        uint64_t count = 0;
+        std::vector<double> duration_samples;  // bounded reservoir for p50
+    };
+    // Drain the aggregator into raw `function_executed` events (clears it).
+    std::vector<PostHogEvent> BuildFunctionAggregateEvents();
+    // Drain + enqueue the aggregated events through the normal pipeline.
+    void FlushFunctionAggregates();
+
     static std::string ComputeDistinctId();
     static std::string Sha256Hex(const std::string& input);
 
@@ -251,6 +277,11 @@ private:
     std::string _duckdb_platform;  // Empty = compile-time detected platform
     mutable std::mutex _thread_lock;
     std::unique_ptr<TelemetryTaskQueue<PostHogEvent>> _queue;
+
+    std::map<std::string, FunctionStat> _function_stats;
+    std::mutex _agg_lock;
+    double _sampling_rate = 1.0;      // 1.0 = record every call
+    uint64_t _sample_counter = 0;     // decimation counter for sampling
 };
 
 } // namespace duckdb
@@ -279,6 +310,8 @@ public:
     void CaptureApplicationStop(const std::string&, const std::string&) {}
     void CaptureFunctionExecution(const std::string&, const std::string&, const std::string&) {}
     void CaptureFunctionExecution(const std::string&, const std::string& = "0.1.0") {}
+    void RecordFunctionCall(const std::string&, double = 0) {}
+    void SetSampling(double) {}
     void SetExtensionName(const std::string&) {}
     std::string GetExtensionName() { return ""; }
     bool IsEnabled() { return false; }
