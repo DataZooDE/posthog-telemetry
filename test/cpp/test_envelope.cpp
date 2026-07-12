@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <future>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
@@ -167,7 +168,8 @@ TEST_CASE("SetSampling - NaN/Inf are handled safely", "[aggregation][sampling]")
     t.DrainFunctionAggregatesForTesting();
 
     REQUIRE_NOTHROW(t.SetSampling(std::nan("")));   // must not UB/crash
-    REQUIRE_NOTHROW(t.SetSampling(1.0 / 0.0));       // +Inf
+    // std::numeric_limits, not 1.0/0.0: MSVC rejects the constant div-by-zero.
+    REQUIRE_NOTHROW(t.SetSampling(std::numeric_limits<double>::infinity()));
     // NaN treated as rate 1.0 (record all): 5 calls -> 5 recorded.
     t.SetSampling(std::nan(""));
     for (int i = 0; i < 5; i++) t.RecordFunctionCall("nan_fn");
