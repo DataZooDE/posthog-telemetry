@@ -22,7 +22,8 @@ A reusable C++ library for integrating PostHog telemetry into DuckDB extensions.
   `Flush()` forces a synchronous drain for short-lived processes; the at-exit
   *discard* stays the safety net.
 - Designed to be included as a git submodule; cross-language schema in
-  [`TELEMETRY-SCHEMA.md`](TELEMETRY-SCHEMA.md).
+  [`TELEMETRY-SCHEMA.md`](TELEMETRY-SCHEMA.md); PostHog **project** setup in
+  [`POSTHOG-SETUP.md`](POSTHOG-SETUP.md).
 
 ## Dependencies
 
