@@ -1,2 +1,4 @@
 build/
 duckdb/
+.antigravity-delegate/
+.codex-delegate/
