@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -75,6 +77,60 @@ static std::string DetectPlatform() {
 #endif
 }
 
+// Escape and quote an arbitrary byte string as a JSON string literal. Handles
+// embedded NULs and control characters; UTF-8 continuation bytes (>= 0x20) pass
+// through untouched. Never throws.
+static std::string EscapeJsonString(const std::string& in)
+{
+    std::string out;
+    out.reserve(in.size() + 2);
+    out += '"';
+    for (unsigned char c : in) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    out += '"';
+    return out;
+}
+
+std::string PropertyValue::ToJson() const
+{
+    switch (kind) {
+        case Kind::Bool:
+            return b ? "true" : "false";
+        case Kind::Int:
+            return std::to_string(i);
+        case Kind::Double: {
+            // JSON has no NaN/Inf; emit 0 rather than invalid JSON.
+            if (!(d == d) || d == std::numeric_limits<double>::infinity() ||
+                d == -std::numeric_limits<double>::infinity()) {
+                return "0";
+            }
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.17g", d);
+            return std::string(buf);
+        }
+        case Kind::String:
+        default:
+            return EscapeJsonString(s);
+    }
+}
+
 std::string PostHogEvent::GetPropertiesJson() const
 {
     std::string json = "{";
@@ -84,7 +140,9 @@ std::string PostHogEvent::GetPropertiesJson() const
         if (!first) {
             json += ",";
         }
-        json += FormatStr("\"%s\": \"%s\"", kv.first.c_str(), kv.second.c_str());
+        json += EscapeJsonString(kv.first);
+        json += ": ";
+        json += kv.second.ToJson();
         first = false;
     }
     json += "}";

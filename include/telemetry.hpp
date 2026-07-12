@@ -18,10 +18,38 @@
 
 namespace duckdb {
 
+// A single property value that serialises to the correct JSON type.
+// Numbers and bools are emitted *unquoted* so PostHog treats them as real
+// numeric/boolean fields (needed for HogQL sum()/avg() over call_count,
+// duration_ms, and for filtering on is_ci). The implicit string ctors keep
+// every existing map<string,string>-style call site (`{"k","v"}`,
+// `props["k"] = "v"`) compiling unchanged.
+struct PropertyValue {
+    enum class Kind { String, Int, Double, Bool } kind;
+    std::string s;
+    int64_t i = 0;
+    double d = 0;
+    bool b = false;
+
+    PropertyValue() : kind(Kind::String) {}                 // for map::operator[]
+    PropertyValue(const char* v) : kind(Kind::String), s(v ? v : "") {}
+    PropertyValue(std::string v) : kind(Kind::String), s(std::move(v)) {}
+    PropertyValue(int v) : kind(Kind::Int), i(v) {}
+    PropertyValue(int64_t v) : kind(Kind::Int), i(v) {}
+    PropertyValue(double v) : kind(Kind::Double), d(v) {}
+    PropertyValue(bool v) : kind(Kind::Bool), b(v) {}
+
+    // Serialise this value as a JSON token (string escaped+quoted; number/bool
+    // bare). Never throws.
+    std::string ToJson() const;
+};
+
+using PropertyMap = std::map<std::string, PropertyValue>;
+
 struct PostHogEvent {
     std::string event_name;
     std::string distinct_id;
-    std::map<std::string, std::string> properties;
+    PropertyMap properties;
 
     std::string GetPropertiesJson() const;
     std::string GetNowISO8601() const;
