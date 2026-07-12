@@ -3,9 +3,12 @@
 #include "catch.hpp"
 #include "telemetry.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace duckdb;
@@ -210,6 +213,83 @@ TEST_CASE("Aggregation - sampling decimates and stamps sample_rate", "[aggregati
     REQUIRE(events[0].properties.count("sample_rate") == 1);
 
     t.SetSampling(1.0);  // restore
+}
+
+TEST_CASE("Batching - buffered captures coalesce into one /batch/ POST", "[batch]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+
+    std::atomic<int> post_count{0};
+    std::atomic<int> total_events{0};
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            post_count++;
+            total_events += static_cast<int>(evs.size());
+        });
+
+    // Drain anything earlier tests left buffered, then reset counters.
+    t.Flush();
+    post_count = 0;
+    total_events = 0;
+
+    const int N = 5;  // < kBatchMaxN, so one Flush coalesces them into one POST
+    for (int i = 0; i < N; i++) {
+        t.CaptureExtensionLoad("batch_ext");
+    }
+    t.Flush();
+
+    REQUIRE(post_count == 1);            // exactly one /batch/ POST for N events
+    REQUIRE(total_events >= N);          // all N events rode in that one POST
+
+    t.SetTransportForTesting({});        // restore real transport
+}
+
+TEST_CASE("Flush - blocks until buffered events are sent", "[flush]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+
+    std::atomic<int> sent{0};
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));  // slow send
+            sent += static_cast<int>(evs.size());
+        });
+
+    t.Flush();      // clear prior
+    sent = 0;
+
+    t.CaptureExtensionLoad("flush_ext");
+    t.Flush();      // must block until the slow transport has finished
+
+    REQUIRE(sent >= 1);
+
+    t.SetTransportForTesting({});
+}
+
+TEST_CASE("SetHost - host is configurable and reaches the transport", "[host]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+
+    std::string seen_host;
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string& host, const std::vector<PostHogEvent>&) {
+            seen_host = host;
+        });
+
+    t.Flush();  // clear prior (may set seen_host to the default; overwritten below)
+
+    t.SetHost("https://custom.example.com");
+    REQUIRE(t.GetHost() == "https://custom.example.com");
+
+    t.CaptureExtensionLoad("host_ext");
+    t.Flush();
+    REQUIRE(seen_host == "https://custom.example.com");
+
+    // Default stays eu.posthog.com until eu.i.posthog.com is verified.
+    t.SetHost("");
+    REQUIRE(t.GetHost() == std::string("https://eu.posthog.com"));
+
+    t.SetTransportForTesting({});
 }
 
 TEST_CASE("Session id - stable within a process, UUID-shaped", "[envelope][session]") {

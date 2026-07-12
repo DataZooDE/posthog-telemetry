@@ -13,6 +13,7 @@
 #include <mutex>
 #include <thread>
 #include <queue>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <atomic>
@@ -56,8 +57,13 @@ struct PostHogEvent {
     std::string GetNowISO8601() const;
 };
 
-// Free function for processing events (exposed for testing)
+// Free function for processing events (exposed for testing). Single-event
+// convenience: POSTs one event to the default host as a batch of one.
 void PostHogProcess(const std::string api_key, const PostHogEvent &event);
+
+// Coalesced transport: POST N events to `host` + "/batch/" as one request.
+void PostHogProcessBatch(const std::string &api_key, const std::string &host,
+                         const std::vector<PostHogEvent> &events);
 
 // Simple thread-safe task queue for background telemetry processing
 template<typename T>
@@ -95,9 +101,20 @@ public:
             std::queue<QueueItem>().swap(tasks);
         }
         condition.notify_all();
+        idle_condition.notify_all();
         if (worker_thread.joinable()) {
             worker_thread.join();
         }
+    }
+
+    // Block until the queue is empty and no task is in flight, or until
+    // timeout_ms elapses. Returns true if the queue drained, false on timeout.
+    // Used by PostHogTelemetry::Flush() for a bounded synchronous drain.
+    bool DrainFor(int timeout_ms) {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        return idle_condition.wait_for(
+            lock, std::chrono::milliseconds(timeout_ms),
+            [this] { return stop_processing || (tasks.empty() && !task_in_flight); });
     }
 
 private:
@@ -122,6 +139,7 @@ private:
                 if (!tasks.empty()) {
                     item = tasks.front();
                     tasks.pop();
+                    task_in_flight = true;
                 } else {
                     continue;
                 }
@@ -132,14 +150,24 @@ private:
             } catch (...) {
                 // Swallowing exceptions to prevent thread crash
             }
+
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                task_in_flight = false;
+                if (tasks.empty()) {
+                    idle_condition.notify_all();
+                }
+            }
         }
     }
 
     std::queue<QueueItem> tasks;
     std::mutex queue_mutex;
     std::condition_variable condition;
+    std::condition_variable idle_condition;
     std::thread worker_thread;
     bool stop_processing;
+    bool task_in_flight = false;
 };
 
 class PostHogTelemetry {
@@ -198,6 +226,24 @@ public:
     std::string GetAPIKey();
     void SetAPIKey(std::string new_key);
 
+    // Ingestion host, e.g. "https://eu.i.posthog.com" (EU) or a self-hosted
+    // URL. PostHogProcessBatch posts to host + "/batch/".
+    void SetHost(const std::string& host);
+    std::string GetHost();
+
+    // Coalesce and synchronously send all buffered events (and drain the
+    // function aggregator), blocking up to a bounded timeout. CLIs/servers call
+    // this before exit so short runs don't lose events. The at-exit *discard*
+    // stays the default safety net; Flush() is the explicit opt-in drain.
+    void Flush();
+
+    // Testing seam: intercept the transport so tests can count /batch/ POSTs and
+    // inspect coalesced payloads without any network I/O. Pass {} to restore the
+    // real HTTPS transport.
+    void SetTransportForTesting(
+        std::function<void(const std::string& api_key, const std::string& host,
+                           const std::vector<PostHogEvent>& events)> fn);
+
     // DuckDB version and platform (for telemetry)
     void SetDuckDBVersion(const std::string& version);
     void SetDuckDBPlatform(const std::string& platform);
@@ -234,6 +280,8 @@ private:
     void Shutdown();
     void EnsureQueueInitialized();
     void EnqueueTelemetryEvent(const PostHogEvent &event);
+    // Move the buffered events into one coalesced /batch/ send task.
+    void FlushBatch();
 
     // Merge the common envelope into a copy of the event (event props win),
     // then length-clamp every string value.
@@ -275,8 +323,14 @@ private:
     std::string _product_edition;  // Envelope product_edition; empty = "oss"
     std::string _duckdb_version;   // Empty = "unknown"
     std::string _duckdb_platform;  // Empty = compile-time detected platform
+    std::string _host;             // Ingestion host; empty = compiled-in default
     mutable std::mutex _thread_lock;
-    std::unique_ptr<TelemetryTaskQueue<PostHogEvent>> _queue;
+    std::unique_ptr<TelemetryTaskQueue<std::vector<PostHogEvent>>> _queue;
+
+    std::vector<PostHogEvent> _pending;   // buffered events awaiting a batch POST
+    std::mutex _batch_lock;
+    std::function<void(const std::string&, const std::string&,
+                       const std::vector<PostHogEvent>&)> _transport;  // test seam
 
     std::map<std::string, FunctionStat> _function_stats;
     std::mutex _agg_lock;
@@ -318,6 +372,9 @@ public:
     void SetEnabled(bool) {}
     std::string GetAPIKey() { return ""; }
     void SetAPIKey(std::string) {}
+    void SetHost(const std::string&) {}
+    std::string GetHost() { return ""; }
+    void Flush() {}
     void SetDuckDBVersion(const std::string&) {}
     void SetDuckDBPlatform(const std::string&) {}
     std::string GetDuckDBVersion() { return ""; }

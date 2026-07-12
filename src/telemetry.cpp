@@ -257,32 +257,46 @@ std::string PostHogEvent::GetNowISO8601() const
     return std::string(buffer);
 }
 
-// Free function for processing events (exposed for testing)
-void PostHogProcess(const std::string api_key, const PostHogEvent &event)
+// Default ingestion host. Kept at eu.posthog.com until eu.i.posthog.com is
+// verified against the project; SetHost() lets callers point elsewhere today.
+static const char* const kDefaultHost = "https://eu.posthog.com";
+
+static bool TelemetryDisabledByEnv()
 {
-    // Check if telemetry is disabled via environment variable
     const char* disable_telemetry = std::getenv("DATAZOO_DISABLE_TELEMETRY");
-    if (disable_telemetry && (std::string(disable_telemetry) == "1" ||
-                              std::string(disable_telemetry) == "true" ||
-                              std::string(disable_telemetry) == "yes")) {
-        return; // Skip telemetry
+    return disable_telemetry && (std::string(disable_telemetry) == "1" ||
+                                 std::string(disable_telemetry) == "true" ||
+                                 std::string(disable_telemetry) == "yes");
+}
+
+// Coalesced transport: serialise N events into one {api_key, batch:[…]} body
+// and POST it to host + "/batch/". This is the only place that touches the
+// network. Best-effort; never throws.
+void PostHogProcessBatch(const std::string &api_key, const std::string &host,
+                         const std::vector<PostHogEvent> &events)
+{
+    if (TelemetryDisabledByEnv() || events.empty()) {
+        return;
     }
 
-    std::string payload = FormatStr(R"(
-        {
-            "api_key": "%s",
-            "batch": [{
-                "event": "%s",
-                "distinct_id": "%s",
-                "properties": %s,
-                "timestamp": "%s"
-            }]
+    std::string batch;
+    for (size_t i = 0; i < events.size(); i++) {
+        const PostHogEvent &e = events[i];
+        if (i) {
+            batch += ",";
         }
-    )", api_key.c_str(), event.event_name.c_str(), event.distinct_id.c_str(),
-        event.GetPropertiesJson().c_str(), event.GetNowISO8601().c_str());
+        batch += "{\"event\":"        + EscapeJsonString(e.event_name);
+        batch += ",\"distinct_id\":"  + EscapeJsonString(e.distinct_id);
+        batch += ",\"properties\":"   + e.GetPropertiesJson();
+        batch += ",\"timestamp\":"    + EscapeJsonString(e.GetNowISO8601());
+        batch += "}";
+    }
+    std::string payload = "{\"api_key\":" + EscapeJsonString(api_key) +
+                          ",\"batch\":[" + batch + "]}";
 
     try {
-        auto cli = duckdb_httplib_openssl::Client("https://eu.posthog.com");
+        std::string h = host.empty() ? kDefaultHost : host;
+        auto cli = duckdb_httplib_openssl::Client(h.c_str());
         if (cli.is_valid() == false) {
             return;
         }
@@ -293,13 +307,18 @@ void PostHogProcess(const std::string api_key, const PostHogEvent &event)
         cli.set_connection_timeout(3);
         cli.set_read_timeout(3);
         cli.set_write_timeout(3);
-        auto url = "/batch/";
-        auto res = cli.Post(url, payload, "application/json");
+        auto res = cli.Post("/batch/", payload, "application/json");
         (void)res;
         cli.stop();
     } catch (...) {
         return;
     }
+}
+
+// Single-event convenience (kept for back-compat / direct tests).
+void PostHogProcess(const std::string api_key, const PostHogEvent &event)
+{
+    PostHogProcessBatch(api_key, kDefaultHost, {event});
 }
 
 // PostHogTelemetry Implementation --------------------------------------------------------
@@ -318,7 +337,7 @@ PostHogTelemetry::~PostHogTelemetry()
 
 void PostHogTelemetry::Shutdown()
 {
-    std::unique_ptr<TelemetryTaskQueue<PostHogEvent>> queue;
+    std::unique_ptr<TelemetryTaskQueue<std::vector<PostHogEvent>>> queue;
     {
         std::lock_guard<std::mutex> t(_thread_lock);
         _shutdown_requested = true;
@@ -356,25 +375,71 @@ void PostHogTelemetry::ShutdownAtExit()
 void PostHogTelemetry::EnsureQueueInitialized()
 {
     if (!_queue) {
-        _queue = std::make_unique<TelemetryTaskQueue<PostHogEvent>>();
+        _queue = std::make_unique<TelemetryTaskQueue<std::vector<PostHogEvent>>>();
     }
 }
 
+// Number of buffered events that triggers an automatic /batch/ flush. Partial
+// batches leave on Flush() (or process exit discards them, per the at-exit
+// discard safety net).
+static constexpr size_t kBatchMaxN = 20;
+
 void PostHogTelemetry::EnqueueTelemetryEvent(const PostHogEvent &event)
 {
-    // Merge the common envelope in exactly one place, before we take the lock
+    // Merge the common envelope in exactly one place, before we take any lock
     // (EnrichEvent/BuildEnvelope acquire _thread_lock themselves).
     PostHogEvent enriched = EnrichEvent(event);
 
-    std::string api_key;
     {
         std::lock_guard<std::mutex> t(_thread_lock);
         if (_shutdown_requested || !_telemetry_enabled) {
             return;
         }
-        api_key = _api_key;
+    }
+
+    size_t n;
+    {
+        std::lock_guard<std::mutex> b(_batch_lock);
+        _pending.push_back(std::move(enriched));
+        n = _pending.size();
+    }
+    if (n >= kBatchMaxN) {
+        FlushBatch();
+    }
+}
+
+void PostHogTelemetry::FlushBatch()
+{
+    std::vector<PostHogEvent> batch;
+    {
+        std::lock_guard<std::mutex> b(_batch_lock);
+        if (_pending.empty()) {
+            return;
+        }
+        batch.swap(_pending);
+    }
+
+    std::string api_key, host;
+    std::function<void(const std::string&, const std::string&,
+                       const std::vector<PostHogEvent>&)> transport;
+    {
+        std::lock_guard<std::mutex> t(_thread_lock);
+        if (_shutdown_requested) {
+            return;  // never start a new send during shutdown (batch is discarded)
+        }
+        api_key   = _api_key;
+        host      = _host.empty() ? kDefaultHost : _host;
+        transport = _transport;
         EnsureQueueInitialized();
-        _queue->EnqueueTask([api_key](auto ev) { PostHogProcess(api_key, ev); }, enriched);
+        _queue->EnqueueTask(
+            [api_key, host, transport](std::vector<PostHogEvent> b) {
+                if (transport) {
+                    transport(api_key, host, b);
+                } else {
+                    PostHogProcessBatch(api_key, host, b);
+                }
+            },
+            std::move(batch));
     }
 }
 
@@ -662,6 +727,43 @@ void PostHogTelemetry::SetAPIKey(std::string new_key)
 {
     std::lock_guard<std::mutex> t(_thread_lock);
     _api_key = new_key;
+}
+
+void PostHogTelemetry::SetHost(const std::string& host)
+{
+    std::lock_guard<std::mutex> t(_thread_lock);
+    _host = host;
+}
+
+std::string PostHogTelemetry::GetHost()
+{
+    std::lock_guard<std::mutex> t(_thread_lock);
+    return _host.empty() ? kDefaultHost : _host;
+}
+
+void PostHogTelemetry::SetTransportForTesting(
+    std::function<void(const std::string&, const std::string&,
+                       const std::vector<PostHogEvent>&)> fn)
+{
+    std::lock_guard<std::mutex> t(_thread_lock);
+    _transport = std::move(fn);
+}
+
+void PostHogTelemetry::Flush()
+{
+    // Drain the function aggregator into the pending buffer, coalesce the
+    // buffer into one send task, then block (bounded) until the queue drains.
+    FlushFunctionAggregates();
+    FlushBatch();
+
+    TelemetryTaskQueue<std::vector<PostHogEvent>>* q = nullptr;
+    {
+        std::lock_guard<std::mutex> t(_thread_lock);
+        q = _queue.get();
+    }
+    if (q) {
+        q->DrainFor(3000);
+    }
 }
 
 void PostHogTelemetry::SetExtensionName(const std::string& name)
