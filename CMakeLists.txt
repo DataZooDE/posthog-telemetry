@@ -3,7 +3,10 @@ if(POLICY CMP0169)
     cmake_policy(SET CMP0169 OLD)  # Allow FetchContent_Populate for header-only fetches
 endif()
 
-project(posthog_telemetry)
+# Version tracks the telemetry schema era: 2.x == telemetry_schema 2
+# (analysis-first envelope, aggregation, sessions, groups). The public API is
+# additive — embedders upgrade without editing call sites.
+project(posthog_telemetry VERSION 2.0.0)
 
 # OpenSSL is required for HTTPS support in httplib
 find_package(OpenSSL REQUIRED)

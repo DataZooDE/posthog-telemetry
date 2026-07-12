@@ -4,13 +4,20 @@ A reusable C++ library for integrating PostHog telemetry into DuckDB extensions.
 
 ## Features
 
-- Asynchronous event queue (non-blocking).
+- Asynchronous event queue (non-blocking) with real batch coalescing.
 - Thread-safe singleton access.
-- Captures `extension_load` and `function_execution` events.
-- Platform detection using `DuckDB::Platform()`.
-- Platform-specific metadata (e.g., MAC address for anonymous identification).
-- **Enabled by default**, with support for user opt-out via DuckDB settings or environment variable.
-- Designed to be included as a git submodule.
+- **Analysis-first schema (`telemetry_schema: 2`)**: a common envelope
+  (`product`, `os`/`arch`, `is_ci`, `is_container`, `$session_id`, `$groups`, …)
+  on every event; generalised `Capture`/`CaptureFeature`/`CaptureError`;
+  aggregated `function_executed` (no per-call firehose); group analytics.
+- Typed properties (`PropertyValue`): numbers and bools serialise as real JSON
+  types for HogQL aggregation.
+- Stable, pseudonymous `distinct_id` (SHA-256 machine id, MAC fallback).
+- **Enabled by default**, with user opt-out via DuckDB settings or environment
+  variable, enforced at the transport (nothing leaves the machine when disabled).
+- `Flush()` for short-lived processes; at-exit *discard* stays the safety net.
+- Designed to be included as a git submodule; cross-language schema in
+  [`TELEMETRY-SCHEMA.md`](TELEMETRY-SCHEMA.md).
 
 ## Dependencies
 
@@ -64,27 +71,65 @@ These are typically available in the DuckDB extension build system.
 
 ## API Reference
 
+Full event schema (envelope, event catalogue, per-product `feature` enums,
+cardinality rule, opt-out contract) lives in
+[`TELEMETRY-SCHEMA.md`](TELEMETRY-SCHEMA.md) — the single source of truth every
+product vendors.
+
 ### PostHogTelemetry
 
 ```cpp
 // Get singleton instance
 static PostHogTelemetry& Instance();
 
-// Set PostHog API key (required before capturing events)
-void SetAPIKey(std::string new_key);
-
-// Enable/disable telemetry
+// --- configuration ---
+void SetProduct(const std::string& name, const std::string& version,
+                const std::string& edition = "oss");   // envelope identity
+void SetAPIKey(std::string new_key);                    // default: shared key
+void SetHost(const std::string& host);                  // default eu.posthog.com
+void SetSampling(double rate);                          // 0..1 for hot events
 void SetEnabled(bool enabled);
 bool IsEnabled();
 
-// Capture extension load event
+// --- capture ---
+void Capture(const std::string& event, PropertyMap props = {});      // general
+void CaptureFeature(const std::string& feature, PropertyMap props = {});
+void CaptureError(const std::string& error_class, PropertyMap props = {}); // -> $exception
+void RecordFunctionCall(const std::string& fn, double duration_ms = 0);    // aggregated
 void CaptureExtensionLoad(const std::string& extension_name,
                           const std::string& extension_version = "0.1.0");
 
-// Capture function execution event
-void CaptureFunctionExecution(const std::string& function_name,
-                              const std::string& function_version = "0.1.0");
+// --- grouping (account-level analytics) ---
+void AssociateGroup(const std::string& type, const std::string& key,
+                    PropertyMap props = {});
+
+// --- lifecycle ---
+void Flush();   // synchronously drain buffered events before exit (bounded)
 ```
+
+`PropertyMap` is `std::map<std::string, PropertyValue>`; `PropertyValue`
+accepts `string`/`int`/`double`/`bool` and serialises numbers and bools as real
+JSON types (so `is_ci`, `call_count`, `duration_ms` aggregate in HogQL).
+
+### Migration to schema 2 (`2.0.0`)
+
+The API is **additive** — existing embedders upgrade the library version
+**without editing any call site**. `CaptureExtensionLoad` /
+`CaptureFunctionExecution` keep working (they dual-emit the legacy
+`extension_load` / `function_execution` names for one release). To adopt the new
+analysis features:
+
+1. **Call `SetProduct(name, version, edition)`** once at startup so events carry
+   a stable `product` identity (otherwise it falls back to the extension name).
+2. Replace per-call `CaptureFunctionExecution` with `RecordFunctionCall` to get
+   aggregated `function_executed` events instead of a per-call firehose.
+3. Emit `CaptureFeature(...)` / `CaptureError(...)` for your top capabilities and
+   failure modes; associate an `account` group for enterprise builds.
+4. Call `Flush()` before exit in short-lived processes/CLIs.
+
+> **Host default:** stays `https://eu.posthog.com`. Flip to
+> `https://eu.i.posthog.com` (PostHog's EU *ingestion* host) via `SetHost(...)`
+> once verified against the project; the default will move in a later release.
 
 ## Disabling Telemetry
 
@@ -112,18 +157,22 @@ See `AI_INTEGRATION_GUIDE.md` for implementation details.
 
 ## Event Properties
 
-### extension_load
-- `extension_name`: Name of the extension
-- `extension_version`: Version string
-- `extension_platform`: Detected platform from `DuckDB::Platform()`
+Every event carries the common **envelope** (`product`, `product_version`,
+`product_edition`, `duckdb_version`, `os`, `arch`, `platform`, `is_ci`,
+`is_container`, `telemetry_schema`, `$session_id`, and `$groups` once a group is
+associated), plus `distinct_id` (stable pseudonymous machine hash) and an
+ISO8601 `timestamp`.
 
-### function_execution
-- `function_name`: Name of the function called
-- `function_version`: Version string
+Event-specific properties and the full catalogue are documented in
+[`TELEMETRY-SCHEMA.md`](TELEMETRY-SCHEMA.md). In brief:
 
-All events include:
-- `distinct_id`: Anonymized MAC address for user identification
-- `timestamp`: ISO8601 formatted timestamp
+| Event | Key properties |
+|---|---|
+| `extension_loaded` (+ legacy `extension_load`) | `extension_name`, `extension_version`, `extension_platform` |
+| `feature_used` | `feature`, `feature_detail`, `duration_ms` |
+| `function_executed` (+ legacy `function_execution`) | `function_name`, `call_count`, `duration_ms_p50`, `sample_rate?` |
+| `$exception` | `error_class` (enum), `feature`, `phase` |
+| `$groupidentify` | `$group_type`, `$group_key`, `$group_set` |
 
 ## License
 
