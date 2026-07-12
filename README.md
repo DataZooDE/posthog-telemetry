@@ -88,7 +88,7 @@ static PostHogTelemetry& Instance();
 void SetProduct(const std::string& name, const std::string& version,
                 const std::string& edition = "oss");   // envelope identity
 void SetAPIKey(std::string new_key);                    // default: shared key
-void SetHost(const std::string& host);                  // default eu.posthog.com
+void SetHost(const std::string& host);                  // default eu.i.posthog.com
 void SetSampling(double rate);                          // 0..1 for hot events
 void SetEnabled(bool enabled);
 bool IsEnabled();
@@ -145,9 +145,9 @@ valid at process exit. Hosts that keep the module loaded for the whole process
 lifetime — the common DuckDB case — need neither: the `atexit` path already tears
 down safely at exit.
 
-> **Host default:** stays `https://eu.posthog.com`. Flip to
-> `https://eu.i.posthog.com` (PostHog's EU *ingestion* host) via `SetHost(...)`
-> once verified against the project; the default will move in a later release.
+> **Host default:** `https://eu.i.posthog.com` — PostHog's EU *ingestion* host
+> (verified: `/batch/` returns 200 directly). Use `SetHost(...)` for a
+> self-hosted / US / other endpoint.
 
 ## Disabling Telemetry
 

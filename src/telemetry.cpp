@@ -290,9 +290,10 @@ std::string PostHogEvent::GetNowISO8601() const
     return std::string(buffer);
 }
 
-// Default ingestion host. Kept at eu.posthog.com until eu.i.posthog.com is
-// verified against the project; SetHost() lets callers point elsewhere today.
-static const char* const kDefaultHost = "https://eu.posthog.com";
+// Default ingestion host. eu.i.posthog.com is PostHog's EU *ingestion* endpoint
+// (verified: /batch/ returns 200 directly, no redirect). SetHost() points at a
+// self-hosted / US / other host in one line.
+static const char* const kDefaultHost = "https://eu.i.posthog.com";
 
 static bool TelemetryDisabledByEnv()
 {
@@ -427,7 +428,7 @@ PostHogTelemetry& PostHogTelemetry::Instance()
         // Statics initialized later than the handler are destroyed before it
         // runs, and an in-flight POST at process exit would touch them dead.
         // No network I/O happens here; the constructor only parses the URL.
-        { duckdb_httplib_openssl::Client warmup("https://eu.posthog.com"); }
+        { duckdb_httplib_openssl::Client warmup(kDefaultHost); }
         auto *telemetry = new PostHogTelemetry();
         std::atexit(&PostHogTelemetry::ShutdownAtExit);
         return telemetry;
