@@ -149,6 +149,12 @@ public:
     PostHogTelemetry(const PostHogTelemetry&) = delete;
     PostHogTelemetry& operator=(const PostHogTelemetry&) = delete;
 
+    // Identify the product for the analysis envelope. Attached to every event
+    // as product / product_version / product_edition. If never called, product
+    // falls back to the extension name from CaptureExtensionLoad.
+    void SetProduct(const std::string& name, const std::string& version,
+                    const std::string& edition = "oss");
+
     // Capture extension load event with name and version
     // Also stores extension_name as default for CaptureFunctionExecution
     void CaptureExtensionLoad(const std::string& extension_name,
@@ -194,6 +200,16 @@ public:
     static std::string GetDistinctId();
     static std::string GetMachineId();
 
+    // Per-process session id (UUID), emitted as $session_id on every event.
+    static std::string GetSessionId();
+
+    // Testing seam: returns the fully enriched event (common envelope merged
+    // with the given props, event props winning on collision, string values
+    // length-clamped) WITHOUT checking the enabled flag or enqueuing. Not part
+    // of the stable embedder API.
+    PostHogEvent BuildEventForTesting(const std::string& event_name,
+                                      PropertyMap props = {});
+
 private:
     PostHogTelemetry();
     ~PostHogTelemetry();
@@ -202,6 +218,19 @@ private:
     void Shutdown();
     void EnsureQueueInitialized();
     void EnqueueTelemetryEvent(const PostHogEvent &event);
+
+    // Merge the common envelope into a copy of the event (event props win),
+    // then length-clamp every string value.
+    PostHogEvent EnrichEvent(const PostHogEvent &event) const;
+    // Build the common envelope (product / version / os / arch / is_ci /
+    // is_container / telemetry_schema / $session_id). One choke point so every
+    // event is stamped identically.
+    PropertyMap BuildEnvelope() const;
+
+    static bool DetectCI();
+    static bool DetectContainer();
+    static const std::string& DetectOs();
+    static const std::string& DetectArch();
 
     static std::string ComputeDistinctId();
     static std::string Sha256Hex(const std::string& input);
@@ -215,9 +244,12 @@ private:
     bool _shutdown_requested;
     std::string _api_key;
     std::string _extension_name;   // Default extension name for CaptureFunctionExecution
+    std::string _product;          // Envelope product; empty = fall back to _extension_name
+    std::string _product_version;  // Envelope product_version
+    std::string _product_edition;  // Envelope product_edition; empty = "oss"
     std::string _duckdb_version;   // Empty = "unknown"
     std::string _duckdb_platform;  // Empty = compile-time detected platform
-    std::mutex _thread_lock;
+    mutable std::mutex _thread_lock;
     std::unique_ptr<TelemetryTaskQueue<PostHogEvent>> _queue;
 };
 
@@ -241,6 +273,7 @@ public:
     PostHogTelemetry(const PostHogTelemetry&) = delete;
     PostHogTelemetry& operator=(const PostHogTelemetry&) = delete;
 
+    void SetProduct(const std::string&, const std::string&, const std::string& = "oss") {}
     void CaptureExtensionLoad(const std::string&, const std::string& = "0.1.0") {}
     void CaptureApplicationStart(const std::string&, const std::string&) {}
     void CaptureApplicationStop(const std::string&, const std::string&) {}
@@ -261,6 +294,7 @@ public:
     static std::string GetMacAddressSafe() { return ""; }
     static std::string GetDistinctId() { return ""; }
     static std::string GetMachineId() { return ""; }
+    static std::string GetSessionId() { return ""; }
 
 private:
     PostHogTelemetry() = default;

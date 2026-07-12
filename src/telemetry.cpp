@@ -9,6 +9,7 @@
 #include <ctime>
 #include <fstream>
 #include <limits>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,104 @@ static std::string DetectPlatform() {
 #else
     return "unknown";
 #endif
+}
+
+// os / arch split for breakdowns (the envelope keeps `platform` too, for
+// continuity with existing dashboards).
+static std::string ComputeOs()
+{
+#if   defined(_WIN32)
+    return "windows";
+#elif defined(__APPLE__)
+    return "macos";
+#elif defined(__linux__)
+    return "linux";
+#else
+    return "unknown";
+#endif
+}
+
+static std::string ComputeArch()
+{
+#if   defined(__aarch64__) || defined(_M_ARM64) || defined(__arm64__)
+    return "arm64";
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__amd64__)
+    return "amd64";
+#else
+    return "unknown";
+#endif
+}
+
+// True when a well-known CI environment variable is present and truthy. Not
+// cached, so a test can fake the environment at runtime.
+static bool ComputeCI()
+{
+    static const char* const vars[] = {
+        "CI", "GITHUB_ACTIONS", "GITLAB_CI", "BUILDKITE",
+        "JENKINS_URL", "TEAMCITY_VERSION", "TF_BUILD", "CIRCLECI"};
+    for (const char* name : vars) {
+        const char* val = std::getenv(name);
+        if (val && *val) {
+            std::string v(val);
+            if (v != "false" && v != "0") {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// True when running inside a container. Cheap file probes; cached once since a
+// process cannot migrate in or out of a container.
+static bool ComputeContainer()
+{
+#ifdef __linux__
+    if (access("/.dockerenv", F_OK) == 0) {
+        return true;
+    }
+    std::ifstream f("/proc/1/cgroup");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.find("docker")     != std::string::npos ||
+            line.find("kubepods")   != std::string::npos ||
+            line.find("containerd") != std::string::npos ||
+            line.find("libpod")     != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
+static std::string GenerateSessionId()
+{
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint64_t> dist;
+    uint64_t a = dist(gen);
+    uint64_t b = dist(gen);
+    char buf[37];
+    std::snprintf(buf, sizeof(buf), "%08x-%04x-%04x-%04x-%012llx",
+                  static_cast<unsigned>(a >> 32),
+                  static_cast<unsigned>((a >> 16) & 0xFFFF),
+                  static_cast<unsigned>(a & 0xFFFF),
+                  static_cast<unsigned>(b >> 48),
+                  static_cast<unsigned long long>(b & 0xFFFFFFFFFFFFULL));
+    return std::string(buf);
+}
+
+// Maximum length of any string property value that leaves the process. This is
+// the load-bearing cardinality/PII guard: even if a caller accidentally passes
+// a table name, SQL text, or free-form message, only a bounded prefix escapes.
+static constexpr size_t kMaxPropertyValueLen = 512;
+
+static void ClampProperty(PropertyValue &v)
+{
+    if (v.kind == PropertyValue::Kind::String && v.s.size() > kMaxPropertyValueLen) {
+        v.s.resize(kMaxPropertyValueLen);
+    }
 }
 
 // Escape and quote an arbitrary byte string as a JSON string literal. Handles
@@ -263,6 +362,10 @@ void PostHogTelemetry::EnsureQueueInitialized()
 
 void PostHogTelemetry::EnqueueTelemetryEvent(const PostHogEvent &event)
 {
+    // Merge the common envelope in exactly one place, before we take the lock
+    // (EnrichEvent/BuildEnvelope acquire _thread_lock themselves).
+    PostHogEvent enriched = EnrichEvent(event);
+
     std::string api_key;
     {
         std::lock_guard<std::mutex> t(_thread_lock);
@@ -271,8 +374,96 @@ void PostHogTelemetry::EnqueueTelemetryEvent(const PostHogEvent &event)
         }
         api_key = _api_key;
         EnsureQueueInitialized();
-        _queue->EnqueueTask([api_key](auto event) { PostHogProcess(api_key, event); }, event);
+        _queue->EnqueueTask([api_key](auto ev) { PostHogProcess(api_key, ev); }, enriched);
     }
+}
+
+bool PostHogTelemetry::DetectCI()
+{
+    return ComputeCI();
+}
+
+bool PostHogTelemetry::DetectContainer()
+{
+    static bool cached = ComputeContainer();
+    return cached;
+}
+
+const std::string& PostHogTelemetry::DetectOs()
+{
+    static const std::string os = ComputeOs();
+    return os;
+}
+
+const std::string& PostHogTelemetry::DetectArch()
+{
+    static const std::string arch = ComputeArch();
+    return arch;
+}
+
+std::string PostHogTelemetry::GetSessionId()
+{
+    static std::string id = GenerateSessionId();
+    return id;
+}
+
+void PostHogTelemetry::SetProduct(const std::string& name,
+                                  const std::string& version,
+                                  const std::string& edition)
+{
+    std::lock_guard<std::mutex> t(_thread_lock);
+    _product = name;
+    _product_version = version;
+    _product_edition = edition;
+}
+
+PropertyMap PostHogTelemetry::BuildEnvelope() const
+{
+    std::string product, product_version, product_edition, duckdb_version, platform;
+    {
+        std::lock_guard<std::mutex> t(_thread_lock);
+        product         = _product.empty() ? _extension_name : _product;
+        product_version = _product_version;
+        product_edition = _product_edition.empty() ? "oss" : _product_edition;
+        duckdb_version  = _duckdb_version.empty() ? "unknown" : _duckdb_version;
+        platform        = _duckdb_platform.empty() ? DetectPlatform() : _duckdb_platform;
+    }
+
+    PropertyMap env;
+    env["product"]          = product;
+    env["product_version"]  = product_version;
+    env["product_edition"]  = product_edition;
+    env["duckdb_version"]   = duckdb_version;
+    env["os"]               = DetectOs();
+    env["arch"]             = DetectArch();
+    env["platform"]         = platform;
+    env["is_ci"]            = DetectCI();          // JSON bool
+    env["is_container"]     = DetectContainer();   // JSON bool
+    env["telemetry_schema"] = 2;                   // JSON number
+    env["$session_id"]      = GetSessionId();
+    return env;
+}
+
+PostHogEvent PostHogTelemetry::EnrichEvent(const PostHogEvent &event) const
+{
+    PostHogEvent enriched = event;
+    PropertyMap env = BuildEnvelope();
+    // Envelope fills only keys the event did not already set: event-specific
+    // properties win on collision.
+    for (auto &kv : env) {
+        enriched.properties.emplace(kv.first, kv.second);
+    }
+    for (auto &kv : enriched.properties) {
+        ClampProperty(kv.second);
+    }
+    return enriched;
+}
+
+PostHogEvent PostHogTelemetry::BuildEventForTesting(const std::string& event_name,
+                                                    PropertyMap props)
+{
+    PostHogEvent event = { event_name, GetDistinctId(), std::move(props) };
+    return EnrichEvent(event);
 }
 
 void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
