@@ -105,8 +105,7 @@ static std::string ComputeArch()
 #endif
 }
 
-// True when a well-known CI environment variable is present and truthy. Not
-// cached, so a test can fake the environment at runtime.
+// True when a well-known CI environment variable is present and truthy.
 static bool ComputeCI()
 {
     static const char* const vars[] = {
@@ -173,7 +172,14 @@ static constexpr size_t kMaxPropertyValueLen = 512;
 static void ClampProperty(PropertyValue &v)
 {
     if (v.kind == PropertyValue::Kind::String && v.s.size() > kMaxPropertyValueLen) {
-        v.s.resize(kMaxPropertyValueLen);
+        // Truncate to the largest UTF-8 char boundary <= the limit so we never
+        // emit a half-character (which would be invalid JSON). If the byte at
+        // the cut is a continuation byte (10xxxxxx), back up to the lead byte.
+        size_t n = kMaxPropertyValueLen;
+        while (n > 0 && (static_cast<unsigned char>(v.s[n]) & 0xC0) == 0x80) {
+            n--;
+        }
+        v.s.resize(n);
     }
 }
 
@@ -225,6 +231,13 @@ std::string PropertyValue::ToJson() const
             }
             char buf[32];
             std::snprintf(buf, sizeof(buf), "%.17g", d);
+            // snprintf's decimal point is locale-dependent (e.g. "1,5" under a
+            // de_DE/fr_FR LC_NUMERIC), which would emit invalid JSON. %g never
+            // uses grouping, so the only such char is the decimal separator —
+            // normalise it back to '.'.
+            for (char* p = buf; *p; ++p) {
+                if (*p == ',') *p = '.';
+            }
             return std::string(buf);
         }
         case Kind::Json:
@@ -289,20 +302,15 @@ static bool TelemetryDisabledByEnv()
                                  std::string(disable_telemetry) == "yes");
 }
 
-// Coalesced transport: serialise N events into one {api_key, batch:[…]} body
-// and POST it to host + "/batch/". This is the only place that touches the
-// network. Best-effort; never throws.
-void PostHogProcessBatch(const std::string &api_key, const std::string &host,
-                         const std::vector<PostHogEvent> &events)
+// POST events[begin, end) as one {api_key, batch:[…]} request. Best-effort.
+static void PostOneChunk(const std::string &api_key, const std::string &host,
+                         const std::vector<PostHogEvent> &events,
+                         size_t begin, size_t end)
 {
-    if (TelemetryDisabledByEnv() || events.empty()) {
-        return;
-    }
-
     std::string batch;
-    for (size_t i = 0; i < events.size(); i++) {
+    for (size_t i = begin; i < end; i++) {
         const PostHogEvent &e = events[i];
-        if (i) {
+        if (i != begin) {
             batch += ",";
         }
         // Prefer the capture-time timestamp; fall back to now for events built
@@ -335,6 +343,23 @@ void PostHogProcessBatch(const std::string &api_key, const std::string &host,
         cli.stop();
     } catch (...) {
         return;
+    }
+}
+
+// Coalesced transport: POST N events to host + "/batch/". Splits large batches
+// into bounded chunks so one request never exceeds PostHog's payload limit (a
+// backlog accumulated during a network outage would otherwise be rejected
+// wholesale). This is the only place that touches the network. Never throws.
+void PostHogProcessBatch(const std::string &api_key, const std::string &host,
+                         const std::vector<PostHogEvent> &events)
+{
+    if (TelemetryDisabledByEnv() || events.empty()) {
+        return;
+    }
+    static constexpr size_t kMaxEventsPerPost = 250;
+    for (size_t i = 0; i < events.size(); i += kMaxEventsPerPost) {
+        size_t end = std::min(i + kMaxEventsPerPost, events.size());
+        PostOneChunk(api_key, host, events, i, end);
     }
 }
 
@@ -423,6 +448,11 @@ void PostHogTelemetry::EnsureQueueInitialized()
     }
 }
 
+// Upper bound on the in-memory buffer so a stalled worker (network outage) can't
+// grow it without limit and OOM the host. Excess events are dropped (best-effort
+// telemetry) rather than crashing the program.
+static constexpr size_t kMaxPendingEvents = 10000;
+
 void PostHogTelemetry::BufferEvent(const PostHogEvent &enriched)
 {
     {
@@ -433,6 +463,9 @@ void PostHogTelemetry::BufferEvent(const PostHogEvent &enriched)
         EnsureQueueInitialized();
     }
     std::lock_guard<std::mutex> b(_batch_lock);
+    if (_pending.size() >= kMaxPendingEvents) {
+        return;  // backpressure: drop rather than risk OOM in the host
+    }
     _pending.push_back(enriched);
 }
 
@@ -512,9 +545,25 @@ void PostHogTelemetry::DrainAndSend()
     }
 }
 
+// CI status can't change within a process run, so compute it once and cache it.
+// This avoids scanning 8 env vars per event and — more importantly — avoids
+// calling std::getenv on every event, which is a data race against a concurrent
+// std::setenv/putenv in the host. Tests reset the cache to fake the environment.
+static std::atomic<int> g_ci_cache{-1};  // -1 = uncomputed, 0/1 = value
+
 bool PostHogTelemetry::DetectCI()
 {
-    return ComputeCI();
+    int c = g_ci_cache.load();
+    if (c < 0) {
+        c = ComputeCI() ? 1 : 0;
+        g_ci_cache.store(c);
+    }
+    return c != 0;
+}
+
+void PostHogTelemetry::ResetDetectionCacheForTesting()
+{
+    g_ci_cache.store(-1);
 }
 
 bool PostHogTelemetry::DetectContainer()
@@ -674,7 +723,15 @@ void PostHogTelemetry::AssociateGroup(const std::string& type,
         std::lock_guard<std::mutex> t(_thread_lock);
         // The 0x1f unit separator can't appear in a well-formed type/key.
         std::string composite = type + "\x1f" + key;
-        need_identify = _identified_groups.insert(composite).second;
+        // Defensive cap: a long-running server servicing many distinct accounts
+        // could otherwise grow this set without bound. Beyond the cap we simply
+        // re-emit $groupidentify (cheap) rather than leak memory tracking it.
+        static constexpr size_t kMaxIdentifiedGroups = 10000;
+        if (_identified_groups.size() >= kMaxIdentifiedGroups) {
+            need_identify = (_identified_groups.count(composite) == 0);
+        } else {
+            need_identify = _identified_groups.insert(composite).second;
+        }
     }
 
     if (need_identify) {
@@ -781,6 +838,10 @@ void PostHogTelemetry::SetSampling(double rate)
 // function-heavy or capture-free workloads still ship stats without waiting for
 // an explicit Flush().
 static constexpr uint64_t kAggFlushThreshold = 256;
+// Defensive cap on how many distinct function names we track, so a caller that
+// (against the cardinality contract) passes unbounded/generated names can't grow
+// the aggregator maps without limit in a long-running process.
+static constexpr size_t kMaxTrackedFunctions = 10000;
 
 void PostHogTelemetry::RecordFunctionCall(const std::string& function_name,
                                           double duration_ms)
@@ -789,11 +850,25 @@ void PostHogTelemetry::RecordFunctionCall(const std::string& function_name,
         return;
     }
 
+    // Sanitize the duration: a NaN would corrupt std::sort's strict-weak-ordering
+    // in MedianOf (UB → hang/crash in the host); a negative is nonsensical.
+    if (!std::isfinite(duration_ms) || duration_ms < 0.0) {
+        duration_ms = 0.0;
+    }
+
     bool emit_prompt = false;
     bool flush_now = false;
     double eff_rate = 1.0;
     {
         std::lock_guard<std::mutex> lock(_agg_lock);
+
+        // Bound distinct-function tracking (defence against unbounded/generated
+        // names); a new function beyond the cap is dropped, existing ones keep
+        // working.
+        if (_sample_seen.find(function_name) == _sample_seen.end() &&
+            _sample_seen.size() >= kMaxTrackedFunctions) {
+            return;
+        }
 
         // Per-function decimation counter that PERSISTS across flushes (a
         // separate map from the drained stats), so decimation stays accurate

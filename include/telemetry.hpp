@@ -300,6 +300,10 @@ public:
     // can assert exact aggregate counts).
     void SetPromptFunctionCallsForTesting(int n);
 
+    // Testing seam: clear the cached is_ci detection so a test can re-fake the
+    // environment (CI status is cached once in production).
+    static void ResetDetectionCacheForTesting();
+
     // DuckDB version and platform (for telemetry)
     void SetDuckDBVersion(const std::string& version);
     void SetDuckDBPlatform(const std::string& platform);

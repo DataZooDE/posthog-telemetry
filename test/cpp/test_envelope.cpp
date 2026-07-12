@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <clocale>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -82,6 +84,7 @@ TEST_CASE("Envelope - is_ci is true under faked GITHUB_ACTIONS", "[envelope][is_
     }
 
     SetEnv("GITHUB_ACTIONS", "true");
+    PostHogTelemetry::ResetDetectionCacheForTesting();   // is_ci is cached now
     std::string json_ci = t.BuildEventForTesting("extension_loaded", {}).GetPropertiesJson();
     // Unquoted JSON boolean true.
     REQUIRE(Contains(json_ci, "\"is_ci\": true"));
@@ -89,12 +92,14 @@ TEST_CASE("Envelope - is_ci is true under faked GITHUB_ACTIONS", "[envelope][is_
 
     // Clear every CI var so the "false" branch is deterministic.
     for (const char* v : ci_vars) UnsetEnv(v);
+    PostHogTelemetry::ResetDetectionCacheForTesting();
     std::string json_no_ci = t.BuildEventForTesting("extension_loaded", {}).GetPropertiesJson();
     REQUIRE(Contains(json_no_ci, "\"is_ci\": false"));
 
     // Restore original environment.
     for (auto& kv : saved) SetEnv(kv.first.c_str(), kv.second.c_str());
     for (auto& v : was_unset) UnsetEnv(v.c_str());
+    PostHogTelemetry::ResetDetectionCacheForTesting();
 }
 
 TEST_CASE("Envelope - product falls back to extension name", "[envelope]") {
@@ -850,6 +855,67 @@ TEST_CASE("Hybrid - first N function calls emit promptly per-call", "[aggregatio
     t.SetAutoFlushEnabledForTesting(false);
     t.SetPromptFunctionCallsForTesting(0);
     t.SetTransportForTesting({});
+}
+
+TEST_CASE("RecordFunctionCall - NaN/negative duration is sanitised, no crash", "[aggregation]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+    t.SetSampling(1.0);
+    t.DrainFunctionAggregatesForTesting();
+
+    // A NaN reaching MedianOf's std::sort would be UB (hang/crash). Guarded.
+    REQUIRE_NOTHROW(t.RecordFunctionCall("nanfn", std::nan("")));
+    for (int i = 0; i < 5; i++) t.RecordFunctionCall("nanfn", std::nan(""));
+    t.RecordFunctionCall("nanfn", -123.0);   // negative also sanitised
+
+    auto events = t.DrainFunctionAggregatesForTesting();
+    bool checked = false;
+    for (auto& e : events) {
+        if (e.event_name == "function_executed" &&
+            e.properties.at("function_name").s == "nanfn") {
+            REQUIRE(std::isfinite(e.properties.at("duration_ms_p50").d));  // finite median
+            checked = true;
+        }
+    }
+    REQUIRE(checked);
+}
+
+TEST_CASE("ToJson - doubles are locale-independent (dot, not comma)", "[typing]") {
+    auto& t = PostHogTelemetry::Instance();
+    char* prev = std::setlocale(LC_NUMERIC, nullptr);
+    std::string saved = prev ? prev : "C";
+    // Try a comma-decimal locale; if unavailable the test still asserts the dot.
+    std::setlocale(LC_NUMERIC, "de_DE.UTF-8");
+
+    PropertyMap props;
+    props["d"] = 1.5;
+    std::string json = t.BuildEventForTesting("feature_used", props).GetPropertiesJson();
+    REQUIRE(Contains(json, "\"d\": 1.5"));
+    REQUIRE_FALSE(Contains(json, "\"d\": 1,5"));
+
+    std::setlocale(LC_NUMERIC, saved.c_str());
+}
+
+TEST_CASE("ClampProperty - truncates on a UTF-8 char boundary", "[envelope][cardinality]") {
+    auto& t = PostHogTelemetry::Instance();
+    // 200 EUR signs = 600 bytes, all 3-byte chars; clamp at 512 must land on a
+    // char boundary (multiple of 3), never mid-character.
+    std::string euros;
+    for (int i = 0; i < 200; i++) euros += "\xE2\x82\xAC";  // U+20AC
+    PropertyMap props;
+    props["u"] = euros;
+
+    PostHogEvent ev = t.BuildEventForTesting("feature_used", props);
+    const std::string& out = ev.properties.at("u").s;
+    REQUIRE(out.size() <= 512);
+    REQUIRE(out.size() % 3 == 0);            // whole 3-byte chars only
+    // Last byte must be a UTF-8 lead byte's tail, i.e. not a dangling continuation.
+    if (!out.empty()) {
+        REQUIRE((static_cast<unsigned char>(out.back()) & 0xC0) == 0x80);  // 0xAC is a cont. byte,
+        // but the char is complete (…E2 82 AC); verify the triple is intact:
+        size_t n = out.size();
+        REQUIRE((static_cast<unsigned char>(out[n - 3]) & 0xF0) == 0xE0);  // lead byte E2
+    }
 }
 
 TEST_CASE("Sampling - extreme rate does not overflow into a firehose", "[aggregation][sampling]") {
