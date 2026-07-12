@@ -12,6 +12,9 @@ Python implementations into one analysable dataset.
 > `DataZooDE/posthog-telemetry`; Python/other tools must emit the **same**
 > envelope, event names, and `$groups` to stay compatible.
 
+For the one-time **PostHog project** configuration (CI filtering, group types,
+person profiles, returning-user filters), see [`POSTHOG-SETUP.md`](POSTHOG-SETUP.md).
+
 ---
 
 ## 1. Envelope — attached to **every** event
