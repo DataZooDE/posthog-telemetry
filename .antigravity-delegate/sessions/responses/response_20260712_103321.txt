@@ -1,0 +1,28 @@
+I will list the contents of the repository first to get a overview of the project structure.
+I will run `git log` and `git diff` commands to understand the changes made in the branch `feat/analysis-first-telemetry` against `main`.
+I will run the git diff command to see the changes in `include/telemetry.hpp` and `src/telemetry.cpp`.
+I will view `include/telemetry.hpp` to see the class definition, variables, and comments.
+I will view `src/telemetry.cpp` to inspect the implementation of the telemetry functions.
+I will view the remaining lines of `src/telemetry.cpp` to inspect the rest of the code.
+I will view the test files in `test/cpp/test_envelope.cpp` to see how the tests are structured and what assertions they are making.
+I will view the rest of the test file `test/cpp/test_envelope.cpp`.
+I will read the Makefile to see what build targets are available.
+I will run `make test` to see if all existing tests are passing on the current branch.
+I will run `make test` again with `BypassSandbox` set to `true` to allow the tests to access `/sys/class/net` and verify if they pass outside the sandbox.
+I will list the directory `test/cpp` to see all the test files.
+I will view `test_queue.cpp` to see how the background task queue is being tested.
+I will write the detailed adversarial code review report as a markdown artifact. This report will cover critical bugs, major behavioral issues, minor concerns, design simplifications, root causes, specific code fixes, testing strategies, and prevention recommendations.
+I have completed an adversarial code review of the C++ telemetry library refactor branch `feat/analysis-first-telemetry` against `main`. 
+
+The complete review report is available in the artifact: [analysis_results.md](file:///home/jr/.gemini/antigravity-cli/brain/b98536c3-08e7-4158-9403-80bb86babbc5/analysis_results.md).
+
+### Summary of Key Issues
+* **Critical**: Thread/memory leaks and exit crashes caused by unloading dynamic libraries/extensions (since `PostHogTelemetry` is leaked, `ShutdownAtExit` and `TelemetryTaskQueue`'s worker thread are not stopped before DLL unmapping).
+* **Critical**: Undefined behavior and potential crashes in `std::sort` due to `NaN` values in function call durations (`MedianOf`).
+* **Major**: JSON payload corruption under non-English locales (locale-sensitive `std::snprintf` outputs localized decimals like `1,5` instead of `1.5`).
+* **Major**: Memory leaks and memory explosion risks (unbounded set of `_identified_groups`, unbounded `_pending` queue size on network stalls, and lack of chunking for massive payloads).
+
+### Key Decisions / Questions requiring your input:
+1. **DLL Unload Callback**: Does the host program have a hook or callback (e.g., inside DuckDB's extension lifecycle) where we can invoke the proposed public cleanup function to safely stop and join the worker thread before unmapping DLL memory?
+2. **Backpressure Strategy**: What is the preferred limit for the in-memory event buffer size (e.g., 1000 events) to prevent OOM during network stalls, and should we drop the newest or oldest events first?
+3. **Group Identification Cache**: Do we want a simple bounded cache or a Bloom filter/hash set eviction policy to handle `_identified_groups` memory capping in long-running servers?

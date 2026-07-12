@@ -41,6 +41,7 @@ include_directories(
 set(TEST_SOURCES
     test_main.cpp
     test_event.cpp
+    test_envelope.cpp
     test_queue.cpp
     test_telemetry.cpp
     test_error_handling.cpp
