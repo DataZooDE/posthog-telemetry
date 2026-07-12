@@ -395,6 +395,83 @@ TEST_CASE("Capture - disabled telemetry produces no events", "[capture]") {
     t.SetTransportForTesting({});
 }
 
+TEST_CASE("Groups - $groupidentify once, then $groups on later events", "[groups]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+
+    std::vector<PostHogEvent> captured;
+    std::mutex m;
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            std::lock_guard<std::mutex> lk(m);
+            for (auto& e : evs) captured.push_back(e);
+        });
+
+    t.Flush();
+    { std::lock_guard<std::mutex> lk(m); captured.clear(); }
+
+    t.AssociateGroup("account", "acct_hash_123", {{"edition", "enterprise"}});
+    t.AssociateGroup("account", "acct_hash_123", {{"edition", "enterprise"}});  // again
+    t.CaptureFeature("sap_rfc", {});
+    t.Flush();
+
+    int account_identifies = 0;
+    bool feature_has_groups = false;
+    for (auto& e : captured) {
+        if (e.event_name == "$groupidentify" &&
+            e.properties.count("$group_key") &&
+            e.properties.at("$group_key").s == "acct_hash_123") {
+            account_identifies++;
+        }
+        if (e.event_name == "feature_used") {
+            auto it = e.properties.find("$groups");
+            if (it != e.properties.end() &&
+                it->second.kind == PropertyValue::Kind::Json &&
+                it->second.s.find("account") != std::string::npos &&
+                it->second.s.find("acct_hash_123") != std::string::npos) {
+                feature_has_groups = true;
+            }
+        }
+    }
+    REQUIRE(account_identifies == 1);   // identify emitted exactly once
+    REQUIRE(feature_has_groups);        // later event carries $groups
+
+    t.SetTransportForTesting({});
+}
+
+TEST_CASE("Groups - $group_set is a nested JSON object, not a quoted string", "[groups]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+
+    std::vector<PostHogEvent> captured;
+    std::mutex m;
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            std::lock_guard<std::mutex> lk(m);
+            for (auto& e : evs) captured.push_back(e);
+        });
+    t.Flush();
+    { std::lock_guard<std::mutex> lk(m); captured.clear(); }
+
+    t.AssociateGroup("deployment", "dep_xyz", {{"first_seen_version", "1.2.3"}});
+    t.Flush();
+
+    bool ok = false;
+    for (auto& e : captured) {
+        if (e.event_name == "$groupidentify" && e.properties.count("$group_set") &&
+            e.properties.at("$group_set").kind == PropertyValue::Kind::Json) {
+            std::string set_json = e.properties.at("$group_set").ToJson();
+            // Unquoted object containing the version.
+            if (set_json.front() == '{' && set_json.find("first_seen_version") != std::string::npos) {
+                ok = true;
+            }
+        }
+    }
+    REQUIRE(ok);
+
+    t.SetTransportForTesting({});
+}
+
 TEST_CASE("Session id - stable within a process, UUID-shaped", "[envelope][session]") {
     std::string a = PostHogTelemetry::GetSessionId();
     std::string b = PostHogTelemetry::GetSessionId();

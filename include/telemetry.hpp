@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -27,7 +28,9 @@ namespace duckdb {
 // every existing map<string,string>-style call site (`{"k","v"}`,
 // `props["k"] = "v"`) compiling unchanged.
 struct PropertyValue {
-    enum class Kind { String, Int, Double, Bool } kind;
+    // Json = an already-serialised JSON fragment emitted verbatim (used for
+    // nested objects like $groups / $group_set that the scalar kinds can't hold).
+    enum class Kind { String, Int, Double, Bool, Json } kind;
     std::string s;
     int64_t i = 0;
     double d = 0;
@@ -41,8 +44,16 @@ struct PropertyValue {
     PropertyValue(double v) : kind(Kind::Double), d(v) {}
     PropertyValue(bool v) : kind(Kind::Bool), b(v) {}
 
+    // Named ctor for a raw, already-valid JSON fragment (object/array/etc.).
+    static PropertyValue Json(std::string raw) {
+        PropertyValue v;
+        v.kind = Kind::Json;
+        v.s = std::move(raw);
+        return v;
+    }
+
     // Serialise this value as a JSON token (string escaped+quoted; number/bool
-    // bare). Never throws.
+    // bare; Json verbatim). Never throws.
     std::string ToJson() const;
 };
 
@@ -204,6 +215,13 @@ public:
     // from a caller-controlled enum — never a free-form message or user data.
     void CaptureError(const std::string& error_class, PropertyMap props = {});
 
+    // Associate this run with a group (e.g. type="deployment"/"account",
+    // key=bounded non-PII id). The first association per (type,key) emits a
+    // `$groupidentify`; afterwards every event carries `$groups` in its
+    // envelope, enabling account-level analytics. ≤ 5 group types per project.
+    void AssociateGroup(const std::string& type, const std::string& key,
+                        PropertyMap props = {});
+
     // Capture function execution event - two overloads:
     // 1. Explicit extension_name
     void CaptureFunctionExecution(const std::string& function_name,
@@ -345,6 +363,9 @@ private:
     std::mutex _agg_lock;
     double _sampling_rate = 1.0;      // 1.0 = record every call
     uint64_t _sample_counter = 0;     // decimation counter for sampling
+
+    std::map<std::string, std::string> _groups;      // group type -> key ($groups)
+    std::set<std::string> _identified_groups;        // (type,key) already $groupidentify'd
 };
 
 } // namespace duckdb
@@ -389,6 +410,7 @@ public:
     void Capture(const std::string&, PropertyMap = {}) {}
     void CaptureFeature(const std::string&, PropertyMap = {}) {}
     void CaptureError(const std::string&, PropertyMap = {}) {}
+    void AssociateGroup(const std::string&, const std::string&, PropertyMap = {}) {}
     void CaptureFunctionExecution(const std::string&, const std::string&, const std::string&) {}
     void CaptureFunctionExecution(const std::string&, const std::string& = "0.1.0") {}
     void RecordFunctionCall(const std::string&, double = 0) {}

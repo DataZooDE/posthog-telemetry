@@ -224,18 +224,21 @@ std::string PropertyValue::ToJson() const
             std::snprintf(buf, sizeof(buf), "%.17g", d);
             return std::string(buf);
         }
+        case Kind::Json:
+            return s;  // already-valid JSON fragment, emitted verbatim
         case Kind::String:
         default:
             return EscapeJsonString(s);
     }
 }
 
-std::string PostHogEvent::GetPropertiesJson() const
+// Serialise a PropertyMap as a JSON object. Shared by event serialization and
+// group-set construction.
+static std::string PropertyMapToJson(const PropertyMap &props)
 {
     std::string json = "{";
     bool first = true;
-    for (auto &kv : properties)
-    {
+    for (auto &kv : props) {
         if (!first) {
             json += ",";
         }
@@ -246,6 +249,11 @@ std::string PostHogEvent::GetPropertiesJson() const
     }
     json += "}";
     return json;
+}
+
+std::string PostHogEvent::GetPropertiesJson() const
+{
+    return PropertyMapToJson(properties);
 }
 
 std::string PostHogEvent::GetNowISO8601() const
@@ -485,6 +493,7 @@ void PostHogTelemetry::SetProduct(const std::string& name,
 PropertyMap PostHogTelemetry::BuildEnvelope() const
 {
     std::string product, product_version, product_edition, duckdb_version, platform;
+    std::string groups_json;
     {
         std::lock_guard<std::mutex> t(_thread_lock);
         product         = _product.empty() ? _extension_name : _product;
@@ -492,6 +501,16 @@ PropertyMap PostHogTelemetry::BuildEnvelope() const
         product_edition = _product_edition.empty() ? "oss" : _product_edition;
         duckdb_version  = _duckdb_version.empty() ? "unknown" : _duckdb_version;
         platform        = _duckdb_platform.empty() ? DetectPlatform() : _duckdb_platform;
+        if (!_groups.empty()) {
+            groups_json = "{";
+            bool first = true;
+            for (auto &g : _groups) {
+                if (!first) groups_json += ",";
+                groups_json += EscapeJsonString(g.first) + ":" + EscapeJsonString(g.second);
+                first = false;
+            }
+            groups_json += "}";
+        }
     }
 
     PropertyMap env;
@@ -506,6 +525,9 @@ PropertyMap PostHogTelemetry::BuildEnvelope() const
     env["is_container"]     = DetectContainer();   // JSON bool
     env["telemetry_schema"] = 2;                   // JSON number
     env["$session_id"]      = GetSessionId();
+    if (!groups_json.empty()) {
+        env["$groups"] = PropertyValue::Json(groups_json);  // nested object
+    }
     return env;
 }
 
@@ -558,11 +580,43 @@ void PostHogTelemetry::CaptureError(const std::string& error_class, PropertyMap 
     Capture("$exception", std::move(props));
 }
 
+void PostHogTelemetry::AssociateGroup(const std::string& type,
+                                      const std::string& key,
+                                      PropertyMap props)
+{
+    // Bound the set values (defence-in-depth against accidental PII).
+    for (auto& kv : props) {
+        ClampProperty(kv.second);
+    }
+
+    bool need_identify = false;
+    {
+        std::lock_guard<std::mutex> t(_thread_lock);
+        _groups[type] = key;
+        // Identify once per (type,key). The 0x1f unit separator can't appear
+        // in a well-formed type/key, so the composite is unambiguous.
+        std::string composite = type + "\x1f" + key;
+        need_identify = _identified_groups.insert(composite).second;
+    }
+
+    if (need_identify) {
+        PropertyMap gi;
+        gi["$group_type"] = type;
+        gi["$group_key"]  = key;
+        gi["$group_set"]  = PropertyValue::Json(PropertyMapToJson(props));
+        Capture("$groupidentify", std::move(gi));
+    }
+}
+
 void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
                                             const std::string& extension_version)
 {
     // Store extension name as default for CaptureFunctionExecution
     SetExtensionName(extension_name);
+
+    // Attribute this install to a `deployment` group (machine hash) so
+    // deployment-level analytics work out of the box, no call-site edits.
+    AssociateGroup("deployment", GetDistinctId());
 
     PropertyMap props;
     props["extension_name"]     = extension_name;
