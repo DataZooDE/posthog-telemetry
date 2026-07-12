@@ -3,10 +3,12 @@
 #include "catch.hpp"
 #include "telemetry.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -166,18 +168,25 @@ TEST_CASE("Aggregation - 1e6 calls collapse to O(#functions) events", "[aggregat
     }
 
     auto events = t.DrainFunctionAggregatesForTesting();
-    REQUIRE(events.size() == static_cast<size_t>(kFns));  // NOT 1e6 events
 
+    // Each function yields one `function_executed` (new) and one legacy
+    // `function_execution` event; both are O(#functions), never 1e6.
+    int executed = 0;
     uint64_t total = 0;
     for (auto& ev : events) {
-        REQUIRE(ev.event_name == "function_executed");
+        if (ev.event_name != "function_executed") {
+            REQUIRE(ev.event_name == "function_execution");  // only the legacy twin
+            continue;
+        }
+        executed++;
         const auto& cc = ev.properties.at("call_count");
         REQUIRE(cc.kind == PropertyValue::Kind::Int);  // numeric, not quoted
         total += static_cast<uint64_t>(cc.i);
         REQUIRE(ev.properties.count("function_name") == 1);
         REQUIRE(ev.properties.count("duration_ms_p50") == 1);
     }
-    REQUIRE(total == static_cast<uint64_t>(kCalls));  // no calls lost
+    REQUIRE(executed == kFns);                         // NOT 1e6 events
+    REQUIRE(total == static_cast<uint64_t>(kCalls));   // no calls lost
 }
 
 TEST_CASE("Aggregation - duration_ms_p50 reflects recorded durations", "[aggregation]") {
@@ -190,8 +199,12 @@ TEST_CASE("Aggregation - duration_ms_p50 reflects recorded durations", "[aggrega
         t.RecordFunctionCall("timed", 10.0);
     }
     auto events = t.DrainFunctionAggregatesForTesting();
-    REQUIRE(events.size() == 1);
-    const auto& p50 = events[0].properties.at("duration_ms_p50");
+    const PostHogEvent* executed = nullptr;
+    for (auto& ev : events) {
+        if (ev.event_name == "function_executed") { executed = &ev; break; }
+    }
+    REQUIRE(executed != nullptr);
+    const auto& p50 = executed->properties.at("duration_ms_p50");
     REQUIRE(p50.kind == PropertyValue::Kind::Double);
     REQUIRE(p50.d == Approx(10.0));
 }
@@ -206,11 +219,15 @@ TEST_CASE("Aggregation - sampling decimates and stamps sample_rate", "[aggregati
         t.RecordFunctionCall("hot");
     }
     auto events = t.DrainFunctionAggregatesForTesting();
-    REQUIRE(events.size() == 1);
-    const auto& cc = events[0].properties.at("call_count");
+    const PostHogEvent* executed = nullptr;
+    for (auto& ev : events) {
+        if (ev.event_name == "function_executed") { executed = &ev; break; }
+    }
+    REQUIRE(executed != nullptr);
+    const auto& cc = executed->properties.at("call_count");
     REQUIRE(cc.i >= 50);
     REQUIRE(cc.i <= 150);                            // decimated, not 1000
-    REQUIRE(events[0].properties.count("sample_rate") == 1);
+    REQUIRE(executed->properties.count("sample_rate") == 1);
 
     t.SetSampling(1.0);  // restore
 }
@@ -289,6 +306,92 @@ TEST_CASE("SetHost - host is configurable and reaches the transport", "[host]") 
     t.SetHost("");
     REQUIRE(t.GetHost() == std::string("https://eu.posthog.com"));
 
+    t.SetTransportForTesting({});
+}
+
+TEST_CASE("Capture - feature_used and $exception shapes", "[capture]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+
+    std::vector<PostHogEvent> captured;
+    std::mutex m;
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            std::lock_guard<std::mutex> lk(m);
+            for (auto& e : evs) captured.push_back(e);
+        });
+
+    t.Flush();
+    { std::lock_guard<std::mutex> lk(m); captured.clear(); }
+
+    t.CaptureFeature("sap_rfc", {{"duration_ms", 12.0}});
+    t.CaptureError("connection_timeout", {{"phase", "connect"}});
+    t.Flush();
+
+    bool feature_ok = false, err_ok = false;
+    for (auto& e : captured) {
+        if (e.event_name == "feature_used" &&
+            e.properties.count("feature") && e.properties.at("feature").s == "sap_rfc") {
+            feature_ok = true;
+        }
+        if (e.event_name == "$exception" &&
+            e.properties.count("error_class") &&
+            e.properties.at("error_class").s == "connection_timeout") {
+            err_ok = true;
+        }
+    }
+    REQUIRE(feature_ok);
+    REQUIRE(err_ok);
+
+    t.SetTransportForTesting({});
+}
+
+TEST_CASE("Dual-emit - extension load emits new and legacy names", "[capture][compat]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+
+    std::vector<std::string> names;
+    std::mutex m;
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            std::lock_guard<std::mutex> lk(m);
+            for (auto& e : evs) names.push_back(e.event_name);
+        });
+
+    t.Flush();
+    { std::lock_guard<std::mutex> lk(m); names.clear(); }
+
+    t.CaptureExtensionLoad("erpl", "1.0.0");
+    t.Flush();
+
+    REQUIRE(std::count(names.begin(), names.end(), "extension_loaded") == 1);
+    REQUIRE(std::count(names.begin(), names.end(), "extension_load") == 1);
+
+    t.SetTransportForTesting({});
+}
+
+TEST_CASE("Capture - disabled telemetry produces no events", "[capture]") {
+    auto& t = PostHogTelemetry::Instance();
+
+    std::atomic<int> count{0};
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            count += static_cast<int>(evs.size());
+        });
+
+    t.SetEnabled(true);
+    t.Flush();       // drain aggregator + buffer
+    count = 0;
+
+    t.SetEnabled(false);
+    t.Capture("should_not_send", {});
+    t.CaptureFeature("nope", {});
+    t.CaptureError("nope", {});
+    t.Flush();
+
+    REQUIRE(count == 0);
+
+    t.SetEnabled(true);
     t.SetTransportForTesting({});
 }
 

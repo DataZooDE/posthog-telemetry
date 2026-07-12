@@ -195,6 +195,15 @@ public:
     void CaptureApplicationStop(const std::string& app_name,
                                  const std::string& app_version);
 
+    // Generalised capture. The single choke point that reads the enabled flag
+    // and opt-out env; all the typed convenience wrappers route through it.
+    void Capture(const std::string& event, PropertyMap props = {});
+    // Emits `feature_used` with a bounded, enumerated `feature` value.
+    void CaptureFeature(const std::string& feature, PropertyMap props = {});
+    // Emits `$exception` with an enumerated `error_class`. Pass ONLY a class
+    // from a caller-controlled enum — never a free-form message or user data.
+    void CaptureError(const std::string& error_class, PropertyMap props = {});
+
     // Capture function execution event - two overloads:
     // 1. Explicit extension_name
     void CaptureFunctionExecution(const std::string& function_name,
@@ -344,9 +353,24 @@ private:
 
 // No-op stubs: every telemetry call compiles to nothing. Keep this in sync
 // with the real public API above.
+#include <cstdint>
+#include <map>
 #include <string>
 
 namespace duckdb {
+
+// Minimal PropertyValue/PropertyMap so call sites passing typed properties to
+// the generalised Capture API compile unchanged when telemetry is disabled.
+struct PropertyValue {
+    PropertyValue() {}
+    PropertyValue(const char*) {}
+    PropertyValue(std::string) {}
+    PropertyValue(int) {}
+    PropertyValue(int64_t) {}
+    PropertyValue(double) {}
+    PropertyValue(bool) {}
+};
+using PropertyMap = std::map<std::string, PropertyValue>;
 
 class PostHogTelemetry {
 public:
@@ -362,6 +386,9 @@ public:
     void CaptureExtensionLoad(const std::string&, const std::string& = "0.1.0") {}
     void CaptureApplicationStart(const std::string&, const std::string&) {}
     void CaptureApplicationStop(const std::string&, const std::string&) {}
+    void Capture(const std::string&, PropertyMap = {}) {}
+    void CaptureFeature(const std::string&, PropertyMap = {}) {}
+    void CaptureError(const std::string&, PropertyMap = {}) {}
     void CaptureFunctionExecution(const std::string&, const std::string&, const std::string&) {}
     void CaptureFunctionExecution(const std::string&, const std::string& = "0.1.0") {}
     void RecordFunctionCall(const std::string&, double = 0) {}

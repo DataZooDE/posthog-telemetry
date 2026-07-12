@@ -531,70 +531,64 @@ PostHogEvent PostHogTelemetry::BuildEventForTesting(const std::string& event_nam
     return EnrichEvent(event);
 }
 
+void PostHogTelemetry::Capture(const std::string& event, PropertyMap props)
+{
+    // The single choke point for the runtime enabled flag; all the convenience
+    // wrappers route through here. The DATAZOO_DISABLE_TELEMETRY opt-out is
+    // enforced at the transport (PostHogProcessBatch) so it is a hard
+    // "nothing leaves the machine" guarantee regardless of this path.
+    if (!_telemetry_enabled) {
+        return;
+    }
+    PostHogEvent ev = { event, GetDistinctId(), std::move(props) };
+    EnqueueTelemetryEvent(ev);
+}
+
+void PostHogTelemetry::CaptureFeature(const std::string& feature, PropertyMap props)
+{
+    props["feature"] = feature;
+    Capture("feature_used", std::move(props));
+}
+
+void PostHogTelemetry::CaptureError(const std::string& error_class, PropertyMap props)
+{
+    // error_class must be an enumerated class, never a free-form message; the
+    // length clamp is a backstop but callers are responsible for the contract.
+    props["error_class"] = error_class;
+    Capture("$exception", std::move(props));
+}
+
 void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
                                             const std::string& extension_version)
 {
     // Store extension name as default for CaptureFunctionExecution
     SetExtensionName(extension_name);
 
-    if (!_telemetry_enabled) {
-        return;
-    }
+    PropertyMap props;
+    props["extension_name"]     = extension_name;
+    props["extension_version"]  = extension_version;
+    props["extension_platform"] = GetDuckDBPlatform();
 
-    PostHogEvent event = {
-        "extension_load",
-        GetDistinctId(),
-        {
-            {"extension_name", extension_name},
-            {"extension_version", extension_version},
-            {"extension_platform", GetDuckDBPlatform()},
-            {"duckdb_version", GetDuckDBVersion()}
-        }
-    };
-
-    EnqueueTelemetryEvent(event);
+    Capture("extension_loaded", props);   // new schema name
+    Capture("extension_load", props);     // legacy dual-emit for one release
 }
 
 void PostHogTelemetry::CaptureApplicationStart(const std::string& app_name,
                                                const std::string& app_version)
 {
-    if (!_telemetry_enabled) {
-        return;
-    }
-
-    PostHogEvent event = {
-        "application_start",
-        GetDistinctId(),
-        {
-            {"app_name", app_name},
-            {"app_version", app_version},
-            {"platform", GetDuckDBPlatform()},
-            {"duckdb_version", GetDuckDBVersion()}
-        }
-    };
-
-    EnqueueTelemetryEvent(event);
+    PropertyMap props;
+    props["app_name"]    = app_name;
+    props["app_version"] = app_version;
+    Capture("application_start", props);
 }
 
 void PostHogTelemetry::CaptureApplicationStop(const std::string& app_name,
                                               const std::string& app_version)
 {
-    if (!_telemetry_enabled) {
-        return;
-    }
-
-    PostHogEvent event = {
-        "application_stop",
-        GetDistinctId(),
-        {
-            {"app_name", app_name},
-            {"app_version", app_version},
-            {"platform", GetDuckDBPlatform()},
-            {"duckdb_version", GetDuckDBVersion()}
-        }
-    };
-
-    EnqueueTelemetryEvent(event);
+    PropertyMap props;
+    props["app_name"]    = app_name;
+    props["app_version"] = app_version;
+    Capture("application_stop", props);
 }
 
 // Overload 1: Explicit extension_name.
@@ -679,7 +673,7 @@ std::vector<PostHogEvent> PostHogTelemetry::BuildFunctionAggregateEvents()
 
     std::string distinct = GetDistinctId();
     std::vector<PostHogEvent> events;
-    events.reserve(snapshot.size());
+    events.reserve(snapshot.size() * 2);
     for (auto& kv : snapshot) {
         PropertyMap props;
         props["function_name"]   = kv.first;
@@ -688,7 +682,8 @@ std::vector<PostHogEvent> PostHogTelemetry::BuildFunctionAggregateEvents()
         if (sample_rate < 1.0) {
             props["sample_rate"] = sample_rate;
         }
-        events.push_back(PostHogEvent{"function_executed", distinct, std::move(props)});
+        events.push_back(PostHogEvent{"function_executed", distinct, props});         // new
+        events.push_back(PostHogEvent{"function_execution", distinct, std::move(props)}); // legacy dual-emit
     }
     return events;
 }
