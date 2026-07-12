@@ -900,6 +900,64 @@ TEST_CASE("ToJson - doubles are locale-independent (dot, not comma)", "[typing]"
     std::setlocale(LC_NUMERIC, saved.c_str());
 }
 
+TEST_CASE("Identity - validity gate never produces a colliding constant", "[identity]") {
+    using T = PostHogTelemetry;
+
+    // Valid machine-id -> best source, 64-char hex.
+    auto mid = T::MakeIdentityForTesting("abcd1234efab5678", "", "sess");
+    REQUIRE(mid.second == "machine_id");
+    REQUIRE(mid.first.size() == 64);
+    REQUIRE(mid.first == T::MakeIdentityForTesting("abcd1234efab5678", "", "sess").first);  // deterministic
+
+    // Empty machine-id + real MAC -> mac source.
+    auto mac = T::MakeIdentityForTesting("", "aa:bb:cc:dd:ee:ff", "sess");
+    REQUIRE(mac.second == "mac");
+
+    // No usable hardware id (empty/zero) -> ephemeral, and CRITICALLY not a
+    // global constant: two processes (different session ids) must NOT collide.
+    auto a = T::MakeIdentityForTesting("", "00:00:00:00:00:00", "sessionA");
+    auto b = T::MakeIdentityForTesting("", "00:00:00:00:00:00", "sessionB");
+    REQUIRE(a.second == "ephemeral");
+    REQUIRE(b.second == "ephemeral");
+    REQUIRE(a.first != b.first);                       // no mass collision
+    REQUIRE(a.first == T::MakeIdentityForTesting("", "00:00:00:00:00:00", "sessionA").first);  // per-process stable
+
+    // All-zero machine-id is treated as no-entropy too.
+    REQUIRE(T::MakeIdentityForTesting("00000000000000000000000000000000", "", "s").second == "ephemeral");
+    // Empty everything still ephemeral (never SHA256("")).
+    REQUIRE(T::MakeIdentityForTesting("", "", "s").second == "ephemeral");
+}
+
+TEST_CASE("Envelope - identity_source present; CI/ephemeral disable person profile", "[identity][envelope]") {
+    auto& t = PostHogTelemetry::Instance();
+
+    const char* const ci_vars[] = {"GITHUB_ACTIONS", "CI", "GITLAB_CI", "BUILDKITE",
+                                    "JENKINS_URL", "TEAMCITY_VERSION", "TF_BUILD", "CIRCLECI"};
+    std::map<std::string, std::string> saved;
+    std::vector<std::string> was_unset;
+    for (const char* v : ci_vars) {
+        if (const char* cur = std::getenv(v)) saved[v] = cur; else was_unset.push_back(v);
+    }
+
+    // Non-CI: real machine has a machine-id, so identity_source=machine_id and
+    // no $process_person_profile override.
+    for (const char* v : ci_vars) UnsetEnv(v);
+    PostHogTelemetry::ResetDetectionCacheForTesting();
+    std::string json = t.BuildEventForTesting("extension_loaded", {}).GetPropertiesJson();
+    REQUIRE(Contains(json, "\"identity_source\": \"machine_id\""));
+    REQUIRE_FALSE(Contains(json, "$process_person_profile"));
+
+    // CI: person profiles disabled so CI runs never look like returning users.
+    SetEnv("GITHUB_ACTIONS", "true");
+    PostHogTelemetry::ResetDetectionCacheForTesting();
+    std::string json_ci = t.BuildEventForTesting("extension_loaded", {}).GetPropertiesJson();
+    REQUIRE(Contains(json_ci, "\"$process_person_profile\": false"));
+
+    for (auto& kv : saved) SetEnv(kv.first.c_str(), kv.second.c_str());
+    for (auto& v : was_unset) UnsetEnv(v.c_str());
+    PostHogTelemetry::ResetDetectionCacheForTesting();
+}
+
 TEST_CASE("ClampProperty - truncates on a UTF-8 char boundary", "[envelope][cardinality]") {
     auto& t = PostHogTelemetry::Instance();
     // 200 EUR signs = 600 bytes, all 3-byte chars; clamp at 512 must land on a

@@ -12,7 +12,10 @@ A reusable C++ library for integrating PostHog telemetry into DuckDB extensions.
   aggregated `function_executed` (no per-call firehose); group analytics.
 - Typed properties (`PropertyValue`): numbers and bools serialise as real JSON
   types for HogQL aggregation.
-- Stable, pseudonymous `distinct_id` (SHA-256 machine id, MAC fallback).
+- Stable, pseudonymous per-machine `distinct_id` (salted SHA-256 of the OS
+  machine id, MAC fallback). Survives reboots/reinstalls/network changes; falls
+  back to a per-process `ephemeral` id (never a colliding constant) when no
+  stable hardware id exists, tagged `identity_source` + `$process_person_profile`.
 - **Enabled by default**, with user opt-out via DuckDB settings or environment
   variable, enforced at the transport (nothing leaves the machine when disabled).
 - Buffered events auto-send on a background interval (and at a size threshold);
@@ -177,9 +180,11 @@ See `AI_INTEGRATION_GUIDE.md` for implementation details.
 
 Every event carries the common **envelope** (`product`, `product_version`,
 `product_edition`, `duckdb_version`, `os`, `arch`, `platform`, `is_ci`,
-`is_container`, `telemetry_schema`, `$session_id`, and `$groups` once a group is
-associated), plus `distinct_id` (stable pseudonymous machine hash) and an
-ISO8601 `timestamp`.
+`is_container`, `telemetry_schema`, `$session_id`, `identity_source`, `$groups`
+once a group is associated, and `$process_person_profile` for ephemeral/CI
+events), plus `distinct_id` (stable pseudonymous machine/deployment hash) and an
+ISO8601 `timestamp`. See [`TELEMETRY-SCHEMA.md`](TELEMETRY-SCHEMA.md) for the
+identity model and provisioning caveats.
 
 Event-specific properties and the full catalogue are documented in
 [`TELEMETRY-SCHEMA.md`](TELEMETRY-SCHEMA.md). In brief:
