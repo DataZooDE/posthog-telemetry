@@ -714,6 +714,60 @@ TEST_CASE("Aggregation - piggybacks on a regular event under auto-flush", "[aggr
     t.SetTransportForTesting({});
 }
 
+TEST_CASE("Hybrid - first N function calls emit promptly per-call", "[aggregation][prompt]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+    t.SetSampling(1.0);
+    t.DrainFunctionAggregatesForTesting();
+
+    std::vector<PostHogEvent> captured;
+    std::mutex m;
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            std::lock_guard<std::mutex> lk(m);
+            for (auto& e : evs) captured.push_back(e);
+        });
+    t.Flush();
+    { std::lock_guard<std::mutex> lk(m); captured.clear(); }
+
+    t.SetAutoFlushEnabledForTesting(true);
+    t.SetPromptFunctionCallsForTesting(3);
+
+    // Two calls (< N) of a fresh function: both ship promptly as call_count=1
+    // events with NO explicit Flush() — this is what saves short sessions.
+    t.RecordFunctionCall("promptfn");
+    t.RecordFunctionCall("promptfn");
+
+    for (int i = 0; i < 100; i++) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            int c = 0;
+            for (auto& e : captured)
+                if (e.event_name == "function_executed" &&
+                    e.properties.at("function_name").s == "promptfn") c++;
+            if (c >= 2) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    int prompt_count = 0;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        for (auto& e : captured) {
+            if (e.event_name == "function_executed" &&
+                e.properties.at("function_name").s == "promptfn") {
+                prompt_count++;
+                REQUIRE(e.properties.at("call_count").i == 1);  // per-call, not aggregated
+            }
+        }
+    }
+    REQUIRE(prompt_count == 2);   // both sent, no Flush() needed
+
+    t.SetAutoFlushEnabledForTesting(false);
+    t.SetPromptFunctionCallsForTesting(0);
+    t.SetTransportForTesting({});
+}
+
 TEST_CASE("Sampling - extreme rate does not overflow into a firehose", "[aggregation][sampling]") {
     auto& t = PostHogTelemetry::Instance();
     t.SetEnabled(true);

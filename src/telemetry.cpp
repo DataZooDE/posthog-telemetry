@@ -741,7 +741,9 @@ void PostHogTelemetry::RecordFunctionCall(const std::string& function_name,
         return;
     }
 
+    bool emit_prompt = false;
     bool flush_now = false;
+    double eff_rate = 1.0;
     {
         std::lock_guard<std::mutex> lock(_agg_lock);
 
@@ -759,20 +761,51 @@ void PostHogTelemetry::RecordFunctionCall(const std::string& function_name,
                 return;
             }
         }
+        eff_rate = _effective_sample_rate;
 
-        // Only create/touch the stat entry when the call is actually recorded,
-        // so dropped calls never leave count==0 entries in the aggregator.
-        static constexpr size_t kMaxDurationSamples = 256;
-        auto& st = _function_stats[function_name];
-        st.count++;
-        if (st.duration_samples.size() < kMaxDurationSamples) {
-            st.duration_samples.push_back(duration_ms);
+        // Hybrid: the first N recorded calls per function are emitted per-call
+        // (prompt) so short sessions never lose them; only once a function
+        // exceeds N does it switch to aggregation (firehose prevention).
+        // sum(call_count) stays correct — prompt events carry call_count=1.
+        uint64_t rec = ++_prompt_recorded[function_name];
+        if (_prompt_function_calls > 0 &&
+            rec <= static_cast<uint64_t>(_prompt_function_calls)) {
+            emit_prompt = true;
         } else {
-            st.duration_samples[st.count % kMaxDurationSamples] = duration_ms;
+            // Only create/touch the stat entry when the call is aggregated, so
+            // dropped calls never leave count==0 entries in the aggregator.
+            static constexpr size_t kMaxDurationSamples = 256;
+            auto& st = _function_stats[function_name];
+            st.count++;
+            if (st.duration_samples.size() < kMaxDurationSamples) {
+                st.duration_samples.push_back(duration_ms);
+            } else {
+                st.duration_samples[st.count % kMaxDurationSamples] = duration_ms;
+            }
+            if (++_recorded_since_flush >= kAggFlushThreshold) {
+                flush_now = true;
+            }
         }
+    }
 
-        if (++_recorded_since_flush >= kAggFlushThreshold) {
-            flush_now = true;
+    // Build/enqueue outside _agg_lock (these take _thread_lock/_batch_lock).
+    if (emit_prompt) {
+        PropertyMap props;
+        props["function_name"]   = function_name;
+        props["call_count"]      = static_cast<int64_t>(1);
+        props["duration_ms_p50"] = duration_ms;
+        std::string ext = GetExtensionName();
+        if (!ext.empty()) {
+            props["extension_name"] = ext;
+        }
+        if (eff_rate < 1.0) {
+            props["sample_rate"] = eff_rate;
+        }
+        PostHogEvent ev{"function_executed", GetDistinctId(), std::move(props), ""};
+        if (_auto_flush.load()) {
+            EnqueueTelemetryEvent(ev);
+        } else {
+            BufferEvent(EnrichEvent(ev));
         }
     }
 
@@ -899,6 +932,12 @@ void PostHogTelemetry::SetTransportForTesting(
 void PostHogTelemetry::SetAutoFlushEnabledForTesting(bool enabled)
 {
     _auto_flush.store(enabled);
+}
+
+void PostHogTelemetry::SetPromptFunctionCallsForTesting(int n)
+{
+    std::lock_guard<std::mutex> lock(_agg_lock);
+    _prompt_function_calls = n;
 }
 
 void PostHogTelemetry::Flush()

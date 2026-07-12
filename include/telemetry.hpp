@@ -284,6 +284,11 @@ public:
     // buffer events and drive sending deterministically via Flush()/Drain.
     void SetAutoFlushEnabledForTesting(bool enabled);
 
+    // Testing seam: number of first-per-function calls emitted per-call before
+    // switching to aggregation. Set to 0 to make all calls aggregate (so tests
+    // can assert exact aggregate counts).
+    void SetPromptFunctionCallsForTesting(int n);
+
     // DuckDB version and platform (for telemetry)
     void SetDuckDBVersion(const std::string& version);
     void SetDuckDBPlatform(const std::string& platform);
@@ -386,8 +391,10 @@ private:
                        const std::vector<PostHogEvent>&)> _transport;  // test seam
 
     std::map<std::string, FunctionStat> _function_stats;
-    std::map<std::string, uint64_t> _sample_seen;  // persistent per-fn decimation counter
-    uint64_t _recorded_since_flush = 0;            // triggers volume-based aggregate flush
+    std::map<std::string, uint64_t> _sample_seen;      // persistent per-fn decimation counter
+    std::map<std::string, uint64_t> _prompt_recorded;  // per-fn recorded count (prompt phase)
+    int _prompt_function_calls = 3;                    // first-N calls emitted per-call
+    uint64_t _recorded_since_flush = 0;                // triggers volume-based aggregate flush
     std::mutex _agg_lock;
     double _sampling_rate = 1.0;          // requested rate; 1.0 = record every call
     uint64_t _sample_stride = 1;          // effective decimation: record 1 of N

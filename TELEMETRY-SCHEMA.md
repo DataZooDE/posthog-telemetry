@@ -68,13 +68,15 @@ to `function_executed` with `sum(call_count)`.
 
 **Delivery / short sessions.** Regular events (`extension_loaded`,
 `feature_used`, `$exception`, `cli_started`, …) are sent **promptly** per
-capture. `function_executed` is *aggregated*, so it ships when the per-session
-recorded-call **threshold** is reached, when a regular event is captured after
-the calls (it piggybacks), or on **`Flush()`**. A process that only records a
-few function calls and exits **without** a trailing event or `Flush()` may not
-report them — the at-exit path discards buffered work by design (OpenSSL
-teardown safety). CLIs/servers should call `Flush()` before exit; extensions get
-function stats whenever any regular event follows the calls.
+capture. `function_executed` uses a **hybrid** model: the first few calls of
+each function are emitted **promptly, per call** (`call_count: 1`) so short
+sessions never lose them; once a function exceeds that, further calls are
+**aggregated** into one `function_executed` (`call_count: N`, `duration_ms_p50`)
+to prevent a firehose. `sum(call_count)` is correct across both forms. Aggregated
+remainders ship on a recorded-call threshold, by piggybacking on the next
+regular event, or on **`Flush()`** — and the at-exit path discards buffered work
+by design (OpenSSL teardown safety), so CLIs/servers should still call `Flush()`
+before exit to capture the tail of a heavy session.
 
 ### Per-product `feature` values (illustrative; keep the set small + enumerated)
 
