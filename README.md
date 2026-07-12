@@ -116,10 +116,13 @@ JSON types (so `is_ci`, `call_count`, `duration_ms` aggregate in HogQL).
 ### Migration to schema 2 (`2.0.0`)
 
 The API is **additive** — existing embedders upgrade the library version
-**without editing any call site**. `CaptureExtensionLoad` /
-`CaptureFunctionExecution` keep working (they dual-emit the legacy
-`extension_load` / `function_execution` names for one release). To adopt the new
-analysis features:
+**without editing any call site**. `CaptureExtensionLoad` keeps working and
+dual-emits the legacy `extension_load` name (same shape) for one release.
+`CaptureFunctionExecution` keeps compiling but now feeds the aggregated
+`function_executed` model (hybrid: first N calls per-call, then aggregated) — the
+legacy per-call `function_execution` name is **retired**, not dual-emitted,
+because aggregation changes its shape; migrate `function_execution` queries to
+`function_executed` with `sum(call_count)`. To adopt the new analysis features:
 
 1. **Call `SetProduct(name, version, edition)`** once at startup so events carry
    a stable `product` identity (otherwise it falls back to the extension name).

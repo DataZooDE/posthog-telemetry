@@ -31,9 +31,10 @@ namespace duckdb {
 struct PropertyValue {
     // Json = an already-serialised JSON fragment emitted verbatim (used for
     // nested objects like $groups / $group_set that the scalar kinds can't hold).
-    enum class Kind { String, Int, Double, Bool, Json } kind;
+    enum class Kind { String, Int, UInt, Double, Bool, Json } kind;
     std::string s;
     int64_t i = 0;
+    uint64_t u = 0;
     double d = 0;
     bool b = false;
 
@@ -42,13 +43,23 @@ struct PropertyValue {
     PropertyValue(std::string v) : kind(Kind::String), s(std::move(v)) {}
     // One ctor for every integral or enum type (int, long, size_t, uint64_t,
     // unscoped enums, …) so no caller hits an ambiguous overload or a lost
-    // enum→int promotion; bool has its own ctor below.
+    // enum→int promotion; bool has its own ctor below. Unsigned values that
+    // don't fit in int64_t keep an UInt kind so they don't serialise negative.
     template <typename T,
               typename std::enable_if<(std::is_integral<T>::value ||
                                        std::is_enum<T>::value) &&
                                           !std::is_same<T, bool>::value,
                                       int>::type = 0>
-    PropertyValue(T v) : kind(Kind::Int), i(static_cast<int64_t>(v)) {}
+    PropertyValue(T v) {
+        if (std::is_unsigned<T>::value &&
+            static_cast<uint64_t>(v) > static_cast<uint64_t>(INT64_MAX)) {
+            kind = Kind::UInt;
+            u = static_cast<uint64_t>(v);
+        } else {
+            kind = Kind::Int;
+            i = static_cast<int64_t>(v);
+        }
+    }
     PropertyValue(double v) : kind(Kind::Double), d(v) {}
     PropertyValue(bool v) : kind(Kind::Bool), b(v) {}
 
@@ -324,13 +335,18 @@ private:
     static void ShutdownAtExit();
     void Shutdown();
     void EnsureQueueInitialized();   // starts the worker queue (lazily)
-    // Enrich + buffer an event; sends promptly (one coalesced /batch/ task on
-    // the worker) unless auto-flush is disabled for testing.
+    // True only when telemetry may do work: enabled and not shutting down.
+    bool CanAcceptTelemetry();
+    // Enrich + buffer an event; sends promptly (coalesced on the worker) unless
+    // auto-flush is disabled for testing.
     void EnqueueTelemetryEvent(const PostHogEvent &event);
     // Append an already-enriched event to the buffer (no send).
     void BufferEvent(const PostHogEvent &enriched);
-    // Swap the buffer into one coalesced /batch/ send task on the worker.
-    void FlushBatch();
+    // Schedule at most one pending drain task on the worker (coalesces bursts,
+    // bounds the worker queue to O(1) tasks regardless of capture rate).
+    void ScheduleSend();
+    // Worker task body: swap the buffer and POST it as one /batch/ request.
+    void DrainAndSend();
 
     // Merge the common envelope into a copy of the event (event props win),
     // then length-clamp every string value.
@@ -355,7 +371,7 @@ private:
     // Drain the aggregator into the pending buffer (no send). Returns true if
     // anything was buffered.
     bool BufferFunctionAggregates();
-    // BufferFunctionAggregates + FlushBatch (one coalesced send task).
+    // BufferFunctionAggregates + ScheduleSend (one coalesced send task).
     void FlushFunctionAggregates();
 
     static std::string ComputeDistinctId();
@@ -378,14 +394,16 @@ private:
     std::string _host;             // Ingestion host; empty = compiled-in default
     mutable std::mutex _thread_lock;
     // shared_ptr so Flush() can hold the queue alive across DrainFor even if a
-    // concurrent Shutdown() resets the member (avoids a use-after-free).
-    std::shared_ptr<TelemetryTaskQueue<std::vector<PostHogEvent>>> _queue;
+    // concurrent Shutdown() resets the member (avoids a use-after-free). The
+    // task payload is an unused signal — each task drains _pending itself.
+    std::shared_ptr<TelemetryTaskQueue<int>> _queue;
 
     // Events are sent promptly per-capture (coalesced on the worker); tests can
     // disable this to buffer and drive sending explicitly.
     std::atomic<bool> _auto_flush{true};
 
     std::vector<PostHogEvent> _pending;   // buffered events awaiting a batch POST
+    bool _flush_scheduled = false;        // a drain task is already queued (coalescing)
     std::mutex _batch_lock;
     std::function<void(const std::string&, const std::string&,
                        const std::vector<PostHogEvent>&)> _transport;  // test seam
@@ -431,6 +449,7 @@ struct PropertyValue {
     PropertyValue(T) {}
     PropertyValue(double) {}
     PropertyValue(bool) {}
+    static PropertyValue Json(std::string) { return PropertyValue(); }
 };
 using PropertyMap = std::map<std::string, PropertyValue>;
 

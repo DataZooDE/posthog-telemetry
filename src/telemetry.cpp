@@ -3,6 +3,7 @@
 #include "telemetry.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -214,6 +215,8 @@ std::string PropertyValue::ToJson() const
             return b ? "true" : "false";
         case Kind::Int:
             return std::to_string(i);
+        case Kind::UInt:
+            return std::to_string(u);
         case Kind::Double: {
             // JSON has no NaN/Inf; emit 0 rather than invalid JSON.
             if (!(d == d) || d == std::numeric_limits<double>::infinity() ||
@@ -357,7 +360,7 @@ PostHogTelemetry::~PostHogTelemetry()
 
 void PostHogTelemetry::Shutdown()
 {
-    std::shared_ptr<TelemetryTaskQueue<std::vector<PostHogEvent>>> queue;
+    std::shared_ptr<TelemetryTaskQueue<int>> queue;
     {
         std::lock_guard<std::mutex> t(_thread_lock);
         _shutdown_requested = true;
@@ -367,6 +370,26 @@ void PostHogTelemetry::Shutdown()
     if (queue) {
         queue->Stop();  // discards pending tasks + joins the worker
     }
+    // Drop any buffered work so nothing is enriched/sent after teardown starts.
+    {
+        std::lock_guard<std::mutex> b(_batch_lock);
+        _pending.clear();
+        _flush_scheduled = false;
+    }
+    {
+        std::lock_guard<std::mutex> a(_agg_lock);
+        _function_stats.clear();
+        _recorded_since_flush = 0;
+    }
+}
+
+// True only when telemetry may do work. Cheap gate used before any enrichment,
+// grouping, aggregate drain, or send so nothing runs during atexit teardown or
+// after a runtime opt-out.
+bool PostHogTelemetry::CanAcceptTelemetry()
+{
+    std::lock_guard<std::mutex> t(_thread_lock);
+    return !_shutdown_requested && _telemetry_enabled;
 }
 
 PostHogTelemetry& PostHogTelemetry::Instance()
@@ -396,7 +419,7 @@ void PostHogTelemetry::ShutdownAtExit()
 void PostHogTelemetry::EnsureQueueInitialized()
 {
     if (!_queue) {
-        _queue = std::make_shared<TelemetryTaskQueue<std::vector<PostHogEvent>>>();
+        _queue = std::make_shared<TelemetryTaskQueue<int>>();
     }
 }
 
@@ -425,22 +448,45 @@ void PostHogTelemetry::EnqueueTelemetryEvent(const PostHogEvent &event)
     }
 
     // Merge the common envelope in exactly one place (EnrichEvent/BuildEnvelope
-    // acquire _thread_lock themselves), buffer it, then send promptly.
+    // acquire _thread_lock themselves), buffer it, then schedule a prompt send.
     BufferEvent(EnrichEvent(event));
 
-    // Send right away (coalescing any burst on the worker), matching the
-    // original per-event promptness so short-lived embedders don't lose events.
-    // Tests disable auto-flush to buffer and drain deterministically.
     if (_auto_flush.load()) {
-        FlushBatch();
+        ScheduleSend();
     }
 }
 
-void PostHogTelemetry::FlushBatch()
+// Schedule at most one drain task. If a task is already queued/running, new
+// events just append to _pending and the existing task picks them up — so the
+// worker queue stays O(1) tasks no matter how fast captures arrive.
+void PostHogTelemetry::ScheduleSend()
+{
+    {
+        std::lock_guard<std::mutex> b(_batch_lock);
+        if (_flush_scheduled || _pending.empty()) {
+            return;
+        }
+        _flush_scheduled = true;
+    }
+    std::lock_guard<std::mutex> t(_thread_lock);
+    if (_shutdown_requested || !_telemetry_enabled) {
+        std::lock_guard<std::mutex> b(_batch_lock);
+        _flush_scheduled = false;   // won't run; let a later attempt reschedule
+        return;
+    }
+    EnsureQueueInitialized();
+    _queue->EnqueueTask([this](int) { DrainAndSend(); }, 0);
+}
+
+// Worker task body: swap the buffer and POST it as one /batch/ request. `this`
+// is the leaked singleton, valid for the whole process; the worker is stopped
+// before nothing else, so no lifetime issue.
+void PostHogTelemetry::DrainAndSend()
 {
     std::vector<PostHogEvent> batch;
     {
         std::lock_guard<std::mutex> b(_batch_lock);
+        _flush_scheduled = false;
         if (_pending.empty()) {
             return;
         }
@@ -452,22 +498,17 @@ void PostHogTelemetry::FlushBatch()
                        const std::vector<PostHogEvent>&)> transport;
     {
         std::lock_guard<std::mutex> t(_thread_lock);
-        if (_shutdown_requested) {
-            return;  // never start a new send during shutdown (batch is discarded)
+        if (_shutdown_requested || !_telemetry_enabled) {
+            return;  // opted out / tearing down: discard the swapped batch
         }
         api_key   = _api_key;
         host      = _host.empty() ? kDefaultHost : _host;
         transport = _transport;
-        EnsureQueueInitialized();
-        _queue->EnqueueTask(
-            [api_key, host, transport](std::vector<PostHogEvent> b) {
-                if (transport) {
-                    transport(api_key, host, b);
-                } else {
-                    PostHogProcessBatch(api_key, host, b);
-                }
-            },
-            std::move(batch));
+    }
+    if (transport) {
+        transport(api_key, host, batch);
+    } else {
+        PostHogProcessBatch(api_key, host, batch);
     }
 }
 
@@ -651,6 +692,12 @@ void PostHogTelemetry::CaptureExtensionLoad(const std::string& extension_name,
     // Store extension name as default for CaptureFunctionExecution
     SetExtensionName(extension_name);
 
+    // Do no further telemetry work (machine-id hashing, group mutation, capture)
+    // when disabled or shutting down.
+    if (!CanAcceptTelemetry()) {
+        return;
+    }
+
     // Attribute this install to a `deployment` group (machine hash) so
     // deployment-level analytics work out of the box, no call-site edits.
     AssociateGroup("deployment", GetDistinctId());
@@ -703,6 +750,7 @@ void PostHogTelemetry::CaptureFunctionExecution(const std::string& function_name
 
 void PostHogTelemetry::SetSampling(double rate)
 {
+    if (!std::isfinite(rate)) rate = 1.0;   // NaN/Inf -> record everything (safe default)
     if (rate < 0.0) rate = 0.0;
     if (rate > 1.0) rate = 1.0;
     std::lock_guard<std::mutex> lock(_agg_lock);
@@ -780,7 +828,8 @@ void PostHogTelemetry::RecordFunctionCall(const std::string& function_name,
             if (st.duration_samples.size() < kMaxDurationSamples) {
                 st.duration_samples.push_back(duration_ms);
             } else {
-                st.duration_samples[st.count % kMaxDurationSamples] = duration_ms;
+                // (count-1) so the ring cycles through every slot including 0.
+                st.duration_samples[(st.count - 1) % kMaxDurationSamples] = duration_ms;
             }
             if (++_recorded_since_flush >= kAggFlushThreshold) {
                 flush_now = true;
@@ -873,10 +922,9 @@ bool PostHogTelemetry::BufferFunctionAggregates()
 
 void PostHogTelemetry::FlushFunctionAggregates()
 {
-    // Buffer all aggregated events, then flush once so a session's function
-    // stats coalesce into a single /batch/ POST instead of one POST per event.
+    // Buffer all aggregated events, then schedule one coalesced send.
     if (BufferFunctionAggregates()) {
-        FlushBatch();
+        ScheduleSend();
     }
 }
 
@@ -942,16 +990,28 @@ void PostHogTelemetry::SetPromptFunctionCallsForTesting(int n)
 
 void PostHogTelemetry::Flush()
 {
-    // Drain the aggregator into the buffer, then coalesce EVERYTHING (aggregates
-    // + any buffered events) into ONE send task before draining. Enqueuing a
-    // single task means a slow in-flight POST can't strand a second queued task
-    // that at-exit Shutdown would then discard.
+    // Do nothing during teardown or after a runtime opt-out: don't enrich, don't
+    // touch function-local statics, don't send. Drop anything already buffered.
+    if (!CanAcceptTelemetry()) {
+        {
+            std::lock_guard<std::mutex> b(_batch_lock);
+            _pending.clear();
+            _flush_scheduled = false;
+        }
+        std::lock_guard<std::mutex> a(_agg_lock);
+        _function_stats.clear();
+        _recorded_since_flush = 0;
+        return;
+    }
+
+    // Drain the aggregator into the buffer, then schedule one coalesced send and
+    // block (bounded) until the worker drains it.
     BufferFunctionAggregates();
-    FlushBatch();
+    ScheduleSend();
 
     // Hold a shared_ptr copy so the queue can't be destroyed by a concurrent
     // Shutdown() while we block in DrainFor (avoids a use-after-free).
-    std::shared_ptr<TelemetryTaskQueue<std::vector<PostHogEvent>>> q;
+    std::shared_ptr<TelemetryTaskQueue<int>> q;
     {
         std::lock_guard<std::mutex> t(_thread_lock);
         q = _queue;

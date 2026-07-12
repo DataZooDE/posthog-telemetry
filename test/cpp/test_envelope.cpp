@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <future>
 #include <map>
 #include <mutex>
 #include <string>
@@ -142,6 +143,89 @@ TEST_CASE("PropertyValue - JSON typing: bool/number unquoted, string quoted", "[
     // None of the numerics/bools are quoted.
     REQUIRE_FALSE(Contains(json, "\"an_int\": \"42\""));
     REQUIRE_FALSE(Contains(json, "\"a_bool\": \"true\""));
+}
+
+TEST_CASE("PropertyValue - unsigned above INT64_MAX serialises positive", "[typing]") {
+    auto& t = PostHogTelemetry::Instance();
+    PropertyMap props;
+    uint64_t big = 18446744073709551615ULL;  // UINT64_MAX, > INT64_MAX
+    props["big"] = big;
+    std::string json = t.BuildEventForTesting("feature_used", props).GetPropertiesJson();
+    // Serialised as the full positive value, not signed-narrowed to -1.
+    REQUIRE(Contains(json, "\"big\": 18446744073709551615"));
+    REQUIRE_FALSE(Contains(json, "\"big\": -"));
+}
+
+TEST_CASE("SetSampling - NaN/Inf are handled safely", "[aggregation][sampling]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+    t.DrainFunctionAggregatesForTesting();
+
+    REQUIRE_NOTHROW(t.SetSampling(std::nan("")));   // must not UB/crash
+    REQUIRE_NOTHROW(t.SetSampling(1.0 / 0.0));       // +Inf
+    // NaN treated as rate 1.0 (record all): 5 calls -> 5 recorded.
+    t.SetSampling(std::nan(""));
+    for (int i = 0; i < 5; i++) t.RecordFunctionCall("nan_fn");
+    int64_t count = 0;
+    for (auto& e : t.DrainFunctionAggregatesForTesting())
+        if (e.event_name == "function_executed" && e.properties.at("function_name").s == "nan_fn")
+            count = e.properties.at("call_count").i;
+    REQUIRE(count == 5);
+    t.SetSampling(1.0);
+}
+
+TEST_CASE("Opt-out - Flush after runtime disable discards buffered events", "[capture]") {
+    auto& t = PostHogTelemetry::Instance();
+    std::atomic<int> sent{0};
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            sent += static_cast<int>(evs.size());
+        });
+
+    t.SetEnabled(true);
+    t.Flush();
+    sent = 0;
+
+    t.CaptureFeature("buffered_then_optout", {});   // buffered (auto-flush off in tests)
+    t.SetEnabled(false);
+    t.Flush();   // opted out: must discard, not send
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    REQUIRE(sent == 0);
+
+    t.SetEnabled(true);
+    t.SetTransportForTesting({});
+}
+
+TEST_CASE("Coalescing - a burst collapses to few POSTs, no loss", "[batch][coalesce]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+
+    std::atomic<int> posts{0};
+    std::atomic<int> events{0};
+    std::promise<void> release;
+    auto fut = release.get_future().share();
+    std::atomic<bool> first{true};
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            if (first.exchange(false)) fut.wait();   // block the first POST so a burst accumulates
+            posts++;
+            events += static_cast<int>(evs.size());
+        });
+
+    t.Flush();
+    posts = 0; events = 0; first = true;
+
+    t.SetAutoFlushEnabledForTesting(true);
+    const int N = 50;
+    for (int i = 0; i < N; i++) t.CaptureFeature("burst", {});
+    release.set_value();
+    t.SetAutoFlushEnabledForTesting(false);
+    t.Flush();   // drain the remainder
+
+    REQUIRE(events.load() == N);   // every event delivered exactly once (no loss/dup)
+    REQUIRE(posts.load() <= 5);    // coalesced, NOT one POST per capture
+
+    t.SetTransportForTesting({});
 }
 
 TEST_CASE("Cardinality guard - long property values are clamped", "[envelope][cardinality]") {
