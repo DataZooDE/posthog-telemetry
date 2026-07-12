@@ -640,6 +640,9 @@ PropertyMap PostHogTelemetry::BuildEnvelope() const
         }
     }
 
+    const bool is_ci = DetectCI();
+    const std::string identity_source = GetIdentitySource();
+
     PropertyMap env;
     env["product"]          = product;
     env["product_version"]  = product_version;
@@ -648,10 +651,17 @@ PropertyMap PostHogTelemetry::BuildEnvelope() const
     env["os"]               = DetectOs();
     env["arch"]             = DetectArch();
     env["platform"]         = platform;
-    env["is_ci"]            = DetectCI();          // JSON bool
-    env["is_container"]     = DetectContainer();   // JSON bool
-    env["telemetry_schema"] = 2;                   // JSON number
+    env["is_ci"]            = is_ci;                // JSON bool
+    env["is_container"]     = DetectContainer();    // JSON bool
+    env["telemetry_schema"] = 2;                    // JSON number
     env["$session_id"]      = GetSessionId();
+    env["identity_source"]  = identity_source;      // machine_id | mac | ephemeral
+    // Don't create/merge a PostHog Person for events that can't be a returning
+    // user: ephemeral identity (no stable hardware id → per-process) or CI runs.
+    // They stay queryable but never pollute Person analytics or the Person DB.
+    if (identity_source == "ephemeral" || is_ci) {
+        env["$process_person_profile"] = false;
+    }
     if (!groups_json.empty()) {
         env["$groups"] = PropertyValue::Json(groups_json);  // nested object
     }
@@ -1169,22 +1179,65 @@ std::string PostHogTelemetry::Sha256Hex(const std::string& input)
     return std::string(hex, SHA256_DIGEST_LENGTH * 2);
 }
 
-std::string PostHogTelemetry::GetDistinctId()
+// Domain-separated salt so our distinct_id can't be trivially reproduced /
+// correlated from the raw machine-id by another dataset. Constant, so identity
+// stays stable across sessions. (Adding it is a one-time reset of existing ids.)
+static const char* const kIdentitySalt = "datazoo-telemetry-v1";
+
+// True when s carries no real hardware entropy: empty, or made up entirely of
+// zeros/separators — e.g. "", "00:00:00:00:00:00", an all-zero machine UUID.
+static bool CarriesNoEntropy(const std::string& s)
 {
-    // C++11 static local: initialized once per process, thread-safe
-    static std::string cached = ComputeDistinctId();
-    return cached;
+    return s.find_first_not_of("0:-") == std::string::npos;
 }
 
-std::string PostHogTelemetry::ComputeDistinctId()
+// Derive {distinct_id, identity_source} from raw inputs. Pure (no I/O) so the
+// validity gate is unit-testable. CRITICAL: never returns a globally-colliding
+// constant — when there is no usable hardware id, it derives a PER-PROCESS id
+// from the session so distinct machines don't collapse into one PostHog Person.
+PostHogTelemetry::Identity PostHogTelemetry::MakeIdentity(const std::string& machine_id,
+                                                          const std::string& mac,
+                                                          const std::string& session_id)
 {
-    // Platform machine ID → SHA-256 (OS-native IDs are stable by design)
-    auto machine_id = GetMachineId();
-    if (!machine_id.empty()) {
-        return Sha256Hex(machine_id);
+    const std::string salt = kIdentitySalt;
+    if (!CarriesNoEntropy(machine_id)) {
+        return { Sha256Hex(salt + ":machine_id:" + machine_id), "machine_id" };
     }
-    // MAC address fallback → SHA-256
-    return Sha256Hex(GetMacAddressSafe());
+    if (!CarriesNoEntropy(mac)) {
+        return { Sha256Hex(salt + ":mac:" + mac), "mac" };
+    }
+    // No stable hardware identity (common in containers/CI): per-process id,
+    // tagged ephemeral so BuildEnvelope sets $process_person_profile=false.
+    return { Sha256Hex(salt + ":ephemeral:" + session_id), "ephemeral" };
+}
+
+PostHogTelemetry::Identity PostHogTelemetry::ComputeIdentity()
+{
+    return MakeIdentity(GetMachineId(), GetMacAddressSafe(), GetSessionId());
+}
+
+const PostHogTelemetry::Identity& PostHogTelemetry::GetIdentity()
+{
+    // C++11 static local: computed once per process, thread-safe.
+    static Identity id = ComputeIdentity();
+    return id;
+}
+
+std::string PostHogTelemetry::GetDistinctId()
+{
+    return GetIdentity().id;
+}
+
+std::string PostHogTelemetry::GetIdentitySource()
+{
+    return GetIdentity().source;
+}
+
+std::pair<std::string, std::string> PostHogTelemetry::MakeIdentityForTesting(
+    const std::string& machine_id, const std::string& mac, const std::string& session_id)
+{
+    Identity ident = MakeIdentity(machine_id, mac, session_id);
+    return { ident.id, ident.source };
 }
 
 #ifdef __linux__
@@ -1291,10 +1344,17 @@ std::string PostHogTelemetry::GetMacAddress()
             str_buf << std::setw(2) << std::setfill('0') << std::hex << static_cast<int>(adapter->Address[i]);
             if (i != (adapter->AddressLength - 1)) str_buf << '-';
         }
-        mac_addresses.push_back(str_buf.str());
+        std::string m = str_buf.str();
+        // Skip all-zero MACs; they carry no entropy and would collide.
+        if (m.find_first_not_of("0-") != std::string::npos) {
+            mac_addresses.push_back(m);
+        }
         adapter = adapter->Next;
     }
 
+    // GetAdaptersInfo's order is not stable across network changes (Wi-Fi/
+    // Ethernet/VPN/docking); sort so the same box picks the same MAC every time.
+    std::sort(mac_addresses.begin(), mac_addresses.end());
     return mac_addresses.empty() ? "" : mac_addresses.front();
 }
 

@@ -33,10 +33,31 @@ pass event-specific properties.
 | `is_container` | **bool** | true under `/.dockerenv` or a container cgroup |
 | `$session_id` | string | one UUID per process/run (enables Paths) |
 | `$groups` | object | e.g. `{ "deployment": "<hash>" }`, present once a group is associated |
+| `identity_source` | string | how `distinct_id` was derived: `machine_id` (best) \| `mac` \| `ephemeral` |
+| `$process_person_profile` | **bool** | set to `false` for `ephemeral` identity or `is_ci` events (no Person created/merged) |
 
-`distinct_id` is the SHA-256 of the OS machine id (MAC fallback) — a **stable,
-pseudonymous person id**. It powers Retention/Lifecycle/Stickiness and must not
-regress to a per-process random id.
+`distinct_id` is a **stable, pseudonymous per-machine (deployment) id** — the
+salted SHA-256 of the OS machine id (`/etc/machine-id`, Windows `MachineGuid`,
+macOS `IOPlatformUUID`), with a MAC-address fallback. It survives reboots, OS
+updates, app reinstalls, user re-login, and network changes, and powers
+Retention/Lifecycle/Stickiness. It must not regress to a per-process random id.
+
+**It identifies a *machine/install*, not an individual human** — all OS users on
+one box share it. For per-account analytics use the `account` group (§4), not
+`distinct_id`.
+
+**Identity quality.** When no stable hardware id is available (containers/CI with
+no `machine-id` and no real MAC), the library does **not** emit a colliding
+constant — it derives a per-process `ephemeral` id and stamps
+`identity_source: ephemeral` + `$process_person_profile: false` so those events
+never create or merge a Person. **Filter Retention/returning-user insights to
+`identity_source = 'machine_id'`** for the most reliable population.
+
+**Provisioning caveat (collision).** A `distinct_id` is only unique if the
+underlying machine id is. VM/container **golden images must be generalised** —
+run `sysprep /generalize` on Windows and truncate `/etc/machine-id` (regenerated
+on first boot) on Linux — or every clone shares one machine id and collapses into
+a single Person.
 
 **Property types are load-bearing.** `is_ci` / `is_container` serialise as JSON
 booleans and `telemetry_schema` / `call_count` / `duration_ms*` as JSON numbers
@@ -133,7 +154,12 @@ call `AssociateGroup("account", sha256(license_id), {edition, first_seen_version
 
 ## 5. Privacy / opt-out contract
 
-- **EU cloud ingestion**; anonymous-by-default pseudonymous `distinct_id`.
+- **EU cloud ingestion** (`eu.i.posthog.com`); anonymous-by-default pseudonymous
+  per-machine `distinct_id` (salted so it can't be trivially reproduced from the
+  raw machine id by another dataset).
+- **No Person for ephemeral/CI**: events with no stable hardware identity or from
+  CI carry `$process_person_profile: false`, so they never create Person profiles
+  (privacy + avoids Person-DB bloat).
 - **Bounded, enumerated properties only** (§3) — the technical guarantee no
   query text, hostnames, or user data ever leave the machine.
 - **Opt-out**, honoured everywhere and enforced at the transport (nothing

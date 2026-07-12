@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 #include <map>
 #include <set>
@@ -331,12 +332,23 @@ public:
     static std::string GetMacAddress();
     static std::string GetMacAddressSafe();
 
-    // Public static methods for stable distinct ID
+    // Stable per-machine person id (the PostHog distinct_id) and how it was
+    // derived: "machine_id" (best), "mac" (fallback), or "ephemeral" (no stable
+    // hardware id — a per-process id that must NOT be treated as a returning
+    // user; events tagged so via $process_person_profile=false).
     static std::string GetDistinctId();
+    static std::string GetIdentitySource();
     static std::string GetMachineId();
 
     // Per-process session id (UUID), emitted as $session_id on every event.
     static std::string GetSessionId();
+
+    // Testing seam: pure identity derivation, so the validity gate can be tested
+    // for empty/all-zero inputs without touching the host machine. Returns
+    // {distinct_id, identity_source}.
+    static std::pair<std::string, std::string> MakeIdentityForTesting(
+        const std::string& machine_id, const std::string& mac,
+        const std::string& session_id);
 
     // Testing seam: returns the fully enriched event (common envelope merged
     // with the given props, event props winning on collision, string values
@@ -395,7 +407,13 @@ private:
     // BufferFunctionAggregates + ScheduleSend (one coalesced send task).
     void FlushFunctionAggregates();
 
-    static std::string ComputeDistinctId();
+    // A derived person identity and the source it came from.
+    struct Identity { std::string id; std::string source; };
+    static Identity MakeIdentity(const std::string& machine_id,
+                                 const std::string& mac,
+                                 const std::string& session_id);
+    static Identity ComputeIdentity();
+    static const Identity& GetIdentity();   // computed once per process
     static std::string Sha256Hex(const std::string& input);
 
 #ifdef __linux__
@@ -515,6 +533,7 @@ public:
     static std::string GetMacAddress() { return ""; }
     static std::string GetMacAddressSafe() { return ""; }
     static std::string GetDistinctId() { return ""; }
+    static std::string GetIdentitySource() { return ""; }
     static std::string GetMachineId() { return ""; }
     static std::string GetSessionId() { return ""; }
 
