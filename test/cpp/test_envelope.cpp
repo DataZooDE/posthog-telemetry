@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -67,21 +69,31 @@ TEST_CASE("Envelope - telemetry_schema is the unquoted number 2", "[envelope]") 
 TEST_CASE("Envelope - is_ci is true under faked GITHUB_ACTIONS", "[envelope][is_ci]") {
     auto& t = PostHogTelemetry::Instance();
 
+    // Save & restore every CI var this test touches so it doesn't leak into the
+    // process environment seen by later test cases.
+    const char* const ci_vars[] = {"GITHUB_ACTIONS", "CI", "GITLAB_CI", "BUILDKITE",
+                                    "JENKINS_URL", "TEAMCITY_VERSION", "TF_BUILD", "CIRCLECI"};
+    std::map<std::string, std::string> saved;
+    std::vector<std::string> was_unset;
+    for (const char* v : ci_vars) {
+        if (const char* cur = std::getenv(v)) saved[v] = cur;
+        else was_unset.push_back(v);
+    }
+
     SetEnv("GITHUB_ACTIONS", "true");
     std::string json_ci = t.BuildEventForTesting("extension_loaded", {}).GetPropertiesJson();
     // Unquoted JSON boolean true.
     REQUIRE(Contains(json_ci, "\"is_ci\": true"));
     REQUIRE_FALSE(Contains(json_ci, "\"is_ci\": \"true\""));
 
-    UnsetEnv("GITHUB_ACTIONS");
-    // Clear any other CI vars that might be set in the real environment so the
-    // "false" branch is deterministic.
-    for (const char* v : {"CI", "GITLAB_CI", "BUILDKITE", "JENKINS_URL",
-                          "TEAMCITY_VERSION", "TF_BUILD", "CIRCLECI"}) {
-        UnsetEnv(v);
-    }
+    // Clear every CI var so the "false" branch is deterministic.
+    for (const char* v : ci_vars) UnsetEnv(v);
     std::string json_no_ci = t.BuildEventForTesting("extension_loaded", {}).GetPropertiesJson();
     REQUIRE(Contains(json_no_ci, "\"is_ci\": false"));
+
+    // Restore original environment.
+    for (auto& kv : saved) SetEnv(kv.first.c_str(), kv.second.c_str());
+    for (auto& v : was_unset) UnsetEnv(v.c_str());
 }
 
 TEST_CASE("Envelope - product falls back to extension name", "[envelope]") {
@@ -169,24 +181,20 @@ TEST_CASE("Aggregation - 1e6 calls collapse to O(#functions) events", "[aggregat
 
     auto events = t.DrainFunctionAggregatesForTesting();
 
-    // Each function yields one `function_executed` (new) and one legacy
-    // `function_execution` event; both are O(#functions), never 1e6.
-    int executed = 0;
+    // One `function_executed` per function — O(#functions), never 1e6. The
+    // legacy per-call `function_execution` name is intentionally NOT dual-emitted
+    // (aggregation changes its shape).
     uint64_t total = 0;
     for (auto& ev : events) {
-        if (ev.event_name != "function_executed") {
-            REQUIRE(ev.event_name == "function_execution");  // only the legacy twin
-            continue;
-        }
-        executed++;
+        REQUIRE(ev.event_name == "function_executed");
         const auto& cc = ev.properties.at("call_count");
         REQUIRE(cc.kind == PropertyValue::Kind::Int);  // numeric, not quoted
         total += static_cast<uint64_t>(cc.i);
         REQUIRE(ev.properties.count("function_name") == 1);
         REQUIRE(ev.properties.count("duration_ms_p50") == 1);
     }
-    REQUIRE(executed == kFns);                         // NOT 1e6 events
-    REQUIRE(total == static_cast<uint64_t>(kCalls));   // no calls lost
+    REQUIRE(events.size() == static_cast<size_t>(kFns));  // NOT 1e6 events
+    REQUIRE(total == static_cast<uint64_t>(kCalls));      // no calls lost
 }
 
 TEST_CASE("Aggregation - duration_ms_p50 reflects recorded durations", "[aggregation]") {
@@ -470,6 +478,276 @@ TEST_CASE("Groups - $group_set is a nested JSON object, not a quoted string", "[
     REQUIRE(ok);
 
     t.SetTransportForTesting({});
+}
+
+TEST_CASE("PropertyValue - unsigned/size_t/long compile unambiguously", "[typing]") {
+    auto& t = PostHogTelemetry::Instance();
+    PropertyMap props;
+    props["u"]      = static_cast<unsigned>(7);
+    props["sz"]     = static_cast<size_t>(1234567);
+    props["l"]      = static_cast<long>(-5);
+    props["ull"]    = static_cast<unsigned long long>(9);
+    props["plain"]  = 42;      // int literal
+    std::string json = t.BuildEventForTesting("feature_used", props).GetPropertiesJson();
+    // All land as unquoted JSON numbers.
+    REQUIRE(Contains(json, "\"sz\": 1234567"));
+    REQUIRE(Contains(json, "\"l\": -5"));
+    REQUIRE(Contains(json, "\"plain\": 42"));
+    REQUIRE_FALSE(Contains(json, "\"sz\": \"1234567\""));
+}
+
+namespace { enum ConnAuth { Basic, Sso, X509 }; }
+
+TEST_CASE("PropertyValue - unscoped enum compiles and serialises as a number", "[typing]") {
+    auto& t = PostHogTelemetry::Instance();
+    PropertyMap props;
+    props["auth_kind"] = Sso;   // unscoped enum, value 1
+    std::string json = t.BuildEventForTesting("feature_used", props).GetPropertiesJson();
+    REQUIRE(Contains(json, "\"auth_kind\": 1"));
+    REQUIRE_FALSE(Contains(json, "\"auth_kind\": \"1\""));
+}
+
+TEST_CASE("Sampling - decimation state persists across flushes", "[aggregation][sampling]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+    t.DrainFunctionAggregatesForTesting();
+    t.SetSampling(0.1);   // stride 10
+
+    // 5 windows of 4 calls = 20 calls, draining between each. With a persistent
+    // per-function counter this records ~2 total; a per-flush-reset counter
+    // would force-record the first call of every window (~5).
+    int64_t recorded_total = 0;
+    for (int w = 0; w < 5; w++) {
+        for (int i = 0; i < 4; i++) t.RecordFunctionCall("g");
+        for (auto& e : t.DrainFunctionAggregatesForTesting()) {
+            if (e.event_name == "function_executed" &&
+                e.properties.at("function_name").s == "g") {
+                recorded_total += e.properties.at("call_count").i;
+            }
+        }
+    }
+    REQUIRE(recorded_total <= 3);   // ~2 with persistence, not ~5 per-window
+
+    t.SetSampling(1.0);
+}
+
+TEST_CASE("Sampling - rate 0 emits no zero-count events", "[aggregation][sampling]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+    t.DrainFunctionAggregatesForTesting();
+
+    t.SetSampling(0.0);
+    for (int i = 0; i < 5; i++) t.RecordFunctionCall("z");
+    auto events = t.DrainFunctionAggregatesForTesting();
+    for (auto& e : events) {
+        // No spurious call_count==0 function events.
+        REQUIRE(e.properties.at("function_name").s != "z");
+    }
+
+    t.SetSampling(1.0);
+}
+
+TEST_CASE("Timestamp - stamped at capture time on the event", "[envelope][timestamp]") {
+    auto& t = PostHogTelemetry::Instance();
+    PostHogEvent ev = t.BuildEventForTesting("feature_used", {});
+    // Capture path stamps an ISO8601 timestamp; not left for send time.
+    REQUIRE(ev.timestamp.size() == 20);
+    REQUIRE(ev.timestamp[10] == 'T');
+    REQUIRE(ev.timestamp[19] == 'Z');
+}
+
+TEST_CASE("Auto-flush - captures send promptly without explicit Flush", "[flush][autoflush]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+
+    std::atomic<int> sent{0};
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            sent += static_cast<int>(evs.size());
+        });
+
+    t.Flush();          // clear prior
+    sent = 0;
+
+    // Enable auto-flush and capture WITHOUT calling Flush.
+    t.SetAutoFlushEnabledForTesting(true);
+    t.CaptureFeature("auto_flushed", {});
+
+    // Poll briefly for the worker to send it on its own.
+    for (int i = 0; i < 200 && sent.load() == 0; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(sent.load() >= 1);   // sent promptly, no Flush() called
+
+    // Restore deterministic test default.
+    t.SetAutoFlushEnabledForTesting(false);
+    t.SetTransportForTesting({});
+}
+
+TEST_CASE("Groups - associate while disabled, then enable, still identifies", "[groups]") {
+    auto& t = PostHogTelemetry::Instance();
+
+    std::vector<PostHogEvent> captured;
+    std::mutex m;
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            std::lock_guard<std::mutex> lk(m);
+            for (auto& e : evs) captured.push_back(e);
+        });
+
+    t.SetEnabled(true);
+    t.Flush();
+    { std::lock_guard<std::mutex> lk(m); captured.clear(); }
+
+    // Associate while disabled: must NOT permanently suppress the identify.
+    t.SetEnabled(false);
+    t.AssociateGroup("account", "acct_toggle", {{"edition", "enterprise"}});
+    t.SetEnabled(true);
+    // Re-associate now that telemetry is enabled.
+    t.AssociateGroup("account", "acct_toggle", {{"edition", "enterprise"}});
+    t.Flush();
+
+    int identifies = 0;
+    for (auto& e : captured) {
+        if (e.event_name == "$groupidentify" &&
+            e.properties.count("$group_key") &&
+            e.properties.at("$group_key").s == "acct_toggle") {
+            identifies++;
+        }
+    }
+    REQUIRE(identifies == 1);
+
+    t.SetTransportForTesting({});
+}
+
+TEST_CASE("Sampling - per-function decimation is unbiased across functions", "[aggregation][sampling]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+    t.DrainFunctionAggregatesForTesting();
+
+    t.SetSampling(0.5);  // stride 2
+    // Strict alternation A,B,A,B,... — the old shared counter recorded only one.
+    for (int i = 0; i < 1000; i++) {
+        t.RecordFunctionCall("A");
+        t.RecordFunctionCall("B");
+    }
+    auto events = t.DrainFunctionAggregatesForTesting();
+
+    int64_t a = 0, b = 0;
+    for (auto& e : events) {
+        if (e.event_name != "function_executed") continue;
+        if (e.properties.at("function_name").s == "A") a = e.properties.at("call_count").i;
+        if (e.properties.at("function_name").s == "B") b = e.properties.at("call_count").i;
+    }
+    REQUIRE(a >= 400);
+    REQUIRE(b >= 400);   // both recorded, not one starved to ~0
+
+    t.SetSampling(1.0);
+}
+
+TEST_CASE("Sampling - non-reciprocal rate stamps the effective rate", "[aggregation][sampling]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+    t.DrainFunctionAggregatesForTesting();
+
+    t.SetSampling(0.3);  // stride round(1/0.3)=3 -> effective 0.3333...
+    for (int i = 0; i < 300; i++) t.RecordFunctionCall("f");
+    auto events = t.DrainFunctionAggregatesForTesting();
+
+    double stamped = -1;
+    int64_t count = 0;
+    for (auto& e : events) {
+        if (e.event_name != "function_executed") continue;
+        stamped = e.properties.at("sample_rate").d;
+        count = e.properties.at("call_count").i;
+    }
+    // Effective rate is 1/3, and count/stamped reconstructs ~300 exactly.
+    REQUIRE(stamped == Approx(1.0 / 3.0).epsilon(0.001));
+    REQUIRE(static_cast<double>(count) / stamped == Approx(300).epsilon(0.02));
+
+    t.SetSampling(1.0);
+}
+
+TEST_CASE("Aggregation - piggybacks on a regular event under auto-flush", "[aggregation][autoflush]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+    t.SetSampling(1.0);
+    t.DrainFunctionAggregatesForTesting();
+
+    std::vector<PostHogEvent> captured;
+    std::mutex m;
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            std::lock_guard<std::mutex> lk(m);
+            for (auto& e : evs) captured.push_back(e);
+        });
+    t.Flush();
+    { std::lock_guard<std::mutex> lk(m); captured.clear(); }
+
+    // Record a few function calls (well below the flush threshold), then emit a
+    // regular event with auto-flush on. The function stats should ride along.
+    t.SetAutoFlushEnabledForTesting(true);
+    for (int i = 0; i < 3; i++) t.RecordFunctionCall("sub_threshold_fn");
+    t.CaptureFeature("some_feature", {});
+
+    for (int i = 0; i < 100; i++) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            bool has_fn = false;
+            for (auto& e : captured)
+                if (e.event_name == "function_executed") has_fn = true;
+            if (has_fn) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    bool shipped = false;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        for (auto& e : captured)
+            if (e.event_name == "function_executed" &&
+                e.properties.at("function_name").s == "sub_threshold_fn") shipped = true;
+    }
+    REQUIRE(shipped);   // function stats shipped alongside the feature event
+
+    t.SetAutoFlushEnabledForTesting(false);
+    t.SetTransportForTesting({});
+}
+
+TEST_CASE("Sampling - extreme rate does not overflow into a firehose", "[aggregation][sampling]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+    t.DrainFunctionAggregatesForTesting();
+
+    t.SetSampling(1e-300);   // absurdly small; 1/rate overflows uint64 if unclamped
+    for (int i = 0; i < 1000; i++) t.RecordFunctionCall("firehose_guard");
+    auto events = t.DrainFunctionAggregatesForTesting();
+    for (auto& e : events) {
+        // Must NOT record everything (which the UB cast would cause).
+        REQUIRE(e.properties.at("call_count").i < 1000);
+    }
+
+    t.SetSampling(1.0);
+}
+
+TEST_CASE("Aggregation - function events carry extension_name", "[aggregation]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+    t.SetSampling(1.0);
+    t.SetExtensionName("erpl");
+    t.DrainFunctionAggregatesForTesting();
+
+    t.RecordFunctionCall("sap_read");
+    auto events = t.DrainFunctionAggregatesForTesting();
+    bool ok = false;
+    for (auto& e : events) {
+        if (e.event_name == "function_executed" &&
+            e.properties.count("extension_name") &&
+            e.properties.at("extension_name").s == "erpl") {
+            ok = true;
+        }
+    }
+    REQUIRE(ok);
 }
 
 TEST_CASE("Session id - stable within a process, UUID-shaped", "[envelope][session]") {

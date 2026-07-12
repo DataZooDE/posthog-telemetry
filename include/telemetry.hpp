@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <string>
+#include <type_traits>
 #include <vector>
 #include <map>
 #include <set>
@@ -39,8 +40,15 @@ struct PropertyValue {
     PropertyValue() : kind(Kind::String) {}                 // for map::operator[]
     PropertyValue(const char* v) : kind(Kind::String), s(v ? v : "") {}
     PropertyValue(std::string v) : kind(Kind::String), s(std::move(v)) {}
-    PropertyValue(int v) : kind(Kind::Int), i(v) {}
-    PropertyValue(int64_t v) : kind(Kind::Int), i(v) {}
+    // One ctor for every integral or enum type (int, long, size_t, uint64_t,
+    // unscoped enums, …) so no caller hits an ambiguous overload or a lost
+    // enum→int promotion; bool has its own ctor below.
+    template <typename T,
+              typename std::enable_if<(std::is_integral<T>::value ||
+                                       std::is_enum<T>::value) &&
+                                          !std::is_same<T, bool>::value,
+                                      int>::type = 0>
+    PropertyValue(T v) : kind(Kind::Int), i(static_cast<int64_t>(v)) {}
     PropertyValue(double v) : kind(Kind::Double), d(v) {}
     PropertyValue(bool v) : kind(Kind::Bool), b(v) {}
 
@@ -63,6 +71,7 @@ struct PostHogEvent {
     std::string event_name;
     std::string distinct_id;
     PropertyMap properties;
+    std::string timestamp;   // ISO8601, stamped at capture time; empty = stamp at send
 
     std::string GetPropertiesJson() const;
     std::string GetNowISO8601() const;
@@ -271,6 +280,10 @@ public:
         std::function<void(const std::string& api_key, const std::string& host,
                            const std::vector<PostHogEvent>& events)> fn);
 
+    // Testing seam: disable the automatic per-event / threshold flush so tests
+    // buffer events and drive sending deterministically via Flush()/Drain.
+    void SetAutoFlushEnabledForTesting(bool enabled);
+
     // DuckDB version and platform (for telemetry)
     void SetDuckDBVersion(const std::string& version);
     void SetDuckDBPlatform(const std::string& platform);
@@ -305,9 +318,13 @@ private:
 
     static void ShutdownAtExit();
     void Shutdown();
-    void EnsureQueueInitialized();
+    void EnsureQueueInitialized();   // starts the worker queue (lazily)
+    // Enrich + buffer an event; sends promptly (one coalesced /batch/ task on
+    // the worker) unless auto-flush is disabled for testing.
     void EnqueueTelemetryEvent(const PostHogEvent &event);
-    // Move the buffered events into one coalesced /batch/ send task.
+    // Append an already-enriched event to the buffer (no send).
+    void BufferEvent(const PostHogEvent &enriched);
+    // Swap the buffer into one coalesced /batch/ send task on the worker.
     void FlushBatch();
 
     // Merge the common envelope into a copy of the event (event props win),
@@ -325,12 +342,15 @@ private:
 
     // Function-call aggregation ------------------------------------------------
     struct FunctionStat {
-        uint64_t count = 0;
+        uint64_t count = 0;   // recorded after sampling (== call_count)
         std::vector<double> duration_samples;  // bounded reservoir for p50
     };
     // Drain the aggregator into raw `function_executed` events (clears it).
     std::vector<PostHogEvent> BuildFunctionAggregateEvents();
-    // Drain + enqueue the aggregated events through the normal pipeline.
+    // Drain the aggregator into the pending buffer (no send). Returns true if
+    // anything was buffered.
+    bool BufferFunctionAggregates();
+    // BufferFunctionAggregates + FlushBatch (one coalesced send task).
     void FlushFunctionAggregates();
 
     static std::string ComputeDistinctId();
@@ -352,7 +372,13 @@ private:
     std::string _duckdb_platform;  // Empty = compile-time detected platform
     std::string _host;             // Ingestion host; empty = compiled-in default
     mutable std::mutex _thread_lock;
-    std::unique_ptr<TelemetryTaskQueue<std::vector<PostHogEvent>>> _queue;
+    // shared_ptr so Flush() can hold the queue alive across DrainFor even if a
+    // concurrent Shutdown() resets the member (avoids a use-after-free).
+    std::shared_ptr<TelemetryTaskQueue<std::vector<PostHogEvent>>> _queue;
+
+    // Events are sent promptly per-capture (coalesced on the worker); tests can
+    // disable this to buffer and drive sending explicitly.
+    std::atomic<bool> _auto_flush{true};
 
     std::vector<PostHogEvent> _pending;   // buffered events awaiting a batch POST
     std::mutex _batch_lock;
@@ -360,9 +386,12 @@ private:
                        const std::vector<PostHogEvent>&)> _transport;  // test seam
 
     std::map<std::string, FunctionStat> _function_stats;
+    std::map<std::string, uint64_t> _sample_seen;  // persistent per-fn decimation counter
+    uint64_t _recorded_since_flush = 0;            // triggers volume-based aggregate flush
     std::mutex _agg_lock;
-    double _sampling_rate = 1.0;      // 1.0 = record every call
-    uint64_t _sample_counter = 0;     // decimation counter for sampling
+    double _sampling_rate = 1.0;          // requested rate; 1.0 = record every call
+    uint64_t _sample_stride = 1;          // effective decimation: record 1 of N
+    double _effective_sample_rate = 1.0;  // 1.0 / _sample_stride, stamped on events
 
     std::map<std::string, std::string> _groups;      // group type -> key ($groups)
     std::set<std::string> _identified_groups;        // (type,key) already $groupidentify'd
@@ -377,6 +406,7 @@ private:
 #include <cstdint>
 #include <map>
 #include <string>
+#include <type_traits>
 
 namespace duckdb {
 
@@ -386,8 +416,12 @@ struct PropertyValue {
     PropertyValue() {}
     PropertyValue(const char*) {}
     PropertyValue(std::string) {}
-    PropertyValue(int) {}
-    PropertyValue(int64_t) {}
+    template <typename T,
+              typename std::enable_if<(std::is_integral<T>::value ||
+                                       std::is_enum<T>::value) &&
+                                          !std::is_same<T, bool>::value,
+                                      int>::type = 0>
+    PropertyValue(T) {}
     PropertyValue(double) {}
     PropertyValue(bool) {}
 };

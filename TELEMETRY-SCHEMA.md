@@ -59,10 +59,22 @@ break it down.
 | `function_executed` | DuckDB function runs (**aggregated**) | `function_name`, `call_count`, `duration_ms_p50`, `sample_rate?` |
 | `$exception` | a caught error | `error_class` (enum, **never** message/data), `feature`, `phase` |
 
-Legacy names `extension_load` and `function_execution` are **dual-emitted for
-one release** (`telemetry_schema: 2`) so existing dashboards don't go dark, then
-dropped. `function_execution` in schema 2 is the *aggregated* twin of
-`function_executed`, **not** the old per-call firehose.
+The legacy `extension_load` name is **dual-emitted for one release**
+(`telemetry_schema: 2`, same shape) so existing dashboards don't go dark, then
+dropped. The legacy per-call `function_execution` is **not** dual-emitted:
+aggregation changes its shape (per-call → per-function `call_count`), so reusing
+the old name would silently corrupt count-based dashboards. Migrate those queries
+to `function_executed` with `sum(call_count)`.
+
+**Delivery / short sessions.** Regular events (`extension_loaded`,
+`feature_used`, `$exception`, `cli_started`, …) are sent **promptly** per
+capture. `function_executed` is *aggregated*, so it ships when the per-session
+recorded-call **threshold** is reached, when a regular event is captured after
+the calls (it piggybacks), or on **`Flush()`**. A process that only records a
+few function calls and exits **without** a trailing event or `Flush()` may not
+report them — the at-exit path discards buffered work by design (OpenSSL
+teardown safety). CLIs/servers should call `Flush()` before exit; extensions get
+function stats whenever any regular event follows the calls.
 
 ### Per-product `feature` values (illustrative; keep the set small + enumerated)
 

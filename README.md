@@ -15,7 +15,9 @@ A reusable C++ library for integrating PostHog telemetry into DuckDB extensions.
 - Stable, pseudonymous `distinct_id` (SHA-256 machine id, MAC fallback).
 - **Enabled by default**, with user opt-out via DuckDB settings or environment
   variable, enforced at the transport (nothing leaves the machine when disabled).
-- `Flush()` for short-lived processes; at-exit *discard* stays the safety net.
+- Buffered events auto-send on a background interval (and at a size threshold);
+  `Flush()` forces a synchronous drain for short-lived processes; the at-exit
+  *discard* stays the safety net.
 - Designed to be included as a git submodule; cross-language schema in
   [`TELEMETRY-SCHEMA.md`](TELEMETRY-SCHEMA.md).
 
@@ -170,7 +172,7 @@ Event-specific properties and the full catalogue are documented in
 |---|---|
 | `extension_loaded` (+ legacy `extension_load`) | `extension_name`, `extension_version`, `extension_platform` |
 | `feature_used` | `feature`, `feature_detail`, `duration_ms` |
-| `function_executed` (+ legacy `function_execution`) | `function_name`, `call_count`, `duration_ms_p50`, `sample_rate?` |
+| `function_executed` (aggregated; legacy `function_execution` retired) | `function_name`, `call_count`, `duration_ms_p50`, `extension_name`, `sample_rate?` |
 | `$exception` | `error_class` (enum), `feature`, `phase` |
 | `$groupidentify` | `$group_type`, `$group_key`, `$group_set` |
 

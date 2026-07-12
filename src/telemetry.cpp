@@ -259,7 +259,16 @@ std::string PostHogEvent::GetPropertiesJson() const
 std::string PostHogEvent::GetNowISO8601() const
 {
     std::time_t t = std::time(nullptr);
-    std::tm tm = *std::localtime(&t);
+    std::tm tm{};
+    // Use UTC (the "Z" suffix asserts UTC) via the reentrant converter — this is
+    // now called from multiple threads, so the shared-static std::gmtime/
+    // std::localtime would be a data race, and localtime would also be wrong by
+    // the machine's timezone offset.
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
     char buffer[32];
     std::strftime(buffer, sizeof(buffer), "%FT%TZ", &tm);
     return std::string(buffer);
@@ -293,10 +302,13 @@ void PostHogProcessBatch(const std::string &api_key, const std::string &host,
         if (i) {
             batch += ",";
         }
+        // Prefer the capture-time timestamp; fall back to now for events built
+        // without one (e.g. direct PostHogEvent construction in tests).
+        const std::string ts = e.timestamp.empty() ? e.GetNowISO8601() : e.timestamp;
         batch += "{\"event\":"        + EscapeJsonString(e.event_name);
         batch += ",\"distinct_id\":"  + EscapeJsonString(e.distinct_id);
         batch += ",\"properties\":"   + e.GetPropertiesJson();
-        batch += ",\"timestamp\":"    + EscapeJsonString(e.GetNowISO8601());
+        batch += ",\"timestamp\":"    + EscapeJsonString(ts);
         batch += "}";
     }
     std::string payload = "{\"api_key\":" + EscapeJsonString(api_key) +
@@ -345,7 +357,7 @@ PostHogTelemetry::~PostHogTelemetry()
 
 void PostHogTelemetry::Shutdown()
 {
-    std::unique_ptr<TelemetryTaskQueue<std::vector<PostHogEvent>>> queue;
+    std::shared_ptr<TelemetryTaskQueue<std::vector<PostHogEvent>>> queue;
     {
         std::lock_guard<std::mutex> t(_thread_lock);
         _shutdown_requested = true;
@@ -353,7 +365,7 @@ void PostHogTelemetry::Shutdown()
         queue = std::move(_queue);
     }
     if (queue) {
-        queue->Stop();
+        queue->Stop();  // discards pending tasks + joins the worker
     }
 }
 
@@ -380,38 +392,46 @@ void PostHogTelemetry::ShutdownAtExit()
     Instance().Shutdown();
 }
 
+// Must be called under _thread_lock. Starts the background worker queue lazily.
 void PostHogTelemetry::EnsureQueueInitialized()
 {
     if (!_queue) {
-        _queue = std::make_unique<TelemetryTaskQueue<std::vector<PostHogEvent>>>();
+        _queue = std::make_shared<TelemetryTaskQueue<std::vector<PostHogEvent>>>();
     }
 }
 
-// Number of buffered events that triggers an automatic /batch/ flush. Partial
-// batches leave on Flush() (or process exit discards them, per the at-exit
-// discard safety net).
-static constexpr size_t kBatchMaxN = 20;
-
-void PostHogTelemetry::EnqueueTelemetryEvent(const PostHogEvent &event)
+void PostHogTelemetry::BufferEvent(const PostHogEvent &enriched)
 {
-    // Merge the common envelope in exactly one place, before we take any lock
-    // (EnrichEvent/BuildEnvelope acquire _thread_lock themselves).
-    PostHogEvent enriched = EnrichEvent(event);
-
     {
         std::lock_guard<std::mutex> t(_thread_lock);
         if (_shutdown_requested || !_telemetry_enabled) {
             return;
         }
+        EnsureQueueInitialized();
+    }
+    std::lock_guard<std::mutex> b(_batch_lock);
+    _pending.push_back(enriched);
+}
+
+void PostHogTelemetry::EnqueueTelemetryEvent(const PostHogEvent &event)
+{
+    // Piggyback: drain any pending function aggregates into the same batch so
+    // they ride along with promptly-sent regular events. This ships function
+    // stats for interleaved workloads without waiting for the volume threshold
+    // or an explicit Flush(). (FlushFunctionAggregates uses BufferEvent, not
+    // this method, so there's no recursion.)
+    if (_auto_flush.load()) {
+        BufferFunctionAggregates();
     }
 
-    size_t n;
-    {
-        std::lock_guard<std::mutex> b(_batch_lock);
-        _pending.push_back(std::move(enriched));
-        n = _pending.size();
-    }
-    if (n >= kBatchMaxN) {
+    // Merge the common envelope in exactly one place (EnrichEvent/BuildEnvelope
+    // acquire _thread_lock themselves), buffer it, then send promptly.
+    BufferEvent(EnrichEvent(event));
+
+    // Send right away (coalescing any burst on the worker), matching the
+    // original per-event promptness so short-lived embedders don't lose events.
+    // Tests disable auto-flush to buffer and drain deterministically.
+    if (_auto_flush.load()) {
         FlushBatch();
     }
 }
@@ -534,6 +554,11 @@ PropertyMap PostHogTelemetry::BuildEnvelope() const
 PostHogEvent PostHogTelemetry::EnrichEvent(const PostHogEvent &event) const
 {
     PostHogEvent enriched = event;
+    // Stamp the capture time now so buffered/coalesced events keep their real
+    // occurrence time instead of the flush time. Respect a pre-set timestamp.
+    if (enriched.timestamp.empty()) {
+        enriched.timestamp = enriched.GetNowISO8601();
+    }
     PropertyMap env = BuildEnvelope();
     // Envelope fills only keys the event did not already set: event-specific
     // properties win on collision.
@@ -549,7 +574,7 @@ PostHogEvent PostHogTelemetry::EnrichEvent(const PostHogEvent &event) const
 PostHogEvent PostHogTelemetry::BuildEventForTesting(const std::string& event_name,
                                                     PropertyMap props)
 {
-    PostHogEvent event = { event_name, GetDistinctId(), std::move(props) };
+    PostHogEvent event = { event_name, GetDistinctId(), std::move(props), "" };
     return EnrichEvent(event);
 }
 
@@ -562,7 +587,7 @@ void PostHogTelemetry::Capture(const std::string& event, PropertyMap props)
     if (!_telemetry_enabled) {
         return;
     }
-    PostHogEvent ev = { event, GetDistinctId(), std::move(props) };
+    PostHogEvent ev = { event, GetDistinctId(), std::move(props), "" };
     EnqueueTelemetryEvent(ev);
 }
 
@@ -589,12 +614,24 @@ void PostHogTelemetry::AssociateGroup(const std::string& type,
         ClampProperty(kv.second);
     }
 
-    bool need_identify = false;
+    // Record the mapping so later events carry $groups even if we don't emit a
+    // $groupidentify right now.
     {
         std::lock_guard<std::mutex> t(_thread_lock);
         _groups[type] = key;
-        // Identify once per (type,key). The 0x1f unit separator can't appear
-        // in a well-formed type/key, so the composite is unambiguous.
+    }
+
+    // Only mark the group identified when we can actually emit the
+    // $groupidentify; otherwise a disabled-at-associate-time group would be
+    // permanently suppressed and never re-identified once telemetry is enabled.
+    if (!_telemetry_enabled) {
+        return;
+    }
+
+    bool need_identify = false;
+    {
+        std::lock_guard<std::mutex> t(_thread_lock);
+        // The 0x1f unit separator can't appear in a well-formed type/key.
         std::string composite = type + "\x1f" + key;
         need_identify = _identified_groups.insert(composite).second;
     }
@@ -670,7 +707,32 @@ void PostHogTelemetry::SetSampling(double rate)
     if (rate > 1.0) rate = 1.0;
     std::lock_guard<std::mutex> lock(_agg_lock);
     _sampling_rate = rate;
+    // Derive the integer decimation stride once and stamp the *effective* rate
+    // (1/stride), not the requested rate, so scaled-up counts are exact.
+    if (rate >= 1.0) {
+        _sample_stride = 1;
+        _effective_sample_rate = 1.0;
+    } else if (rate <= 0.0) {
+        _sample_stride = 0;            // 0 => drop everything
+        _effective_sample_rate = 0.0;
+    } else {
+        // Clamp before the double->uint64 cast: a tiny rate makes 1/rate exceed
+        // UINT64_MAX, where the cast is UB and can wrap to 0 -> stride 1 -> a
+        // full firehose (the opposite of what was asked). Cap the stride instead.
+        double inv = 1.0 / rate + 0.5;
+        static constexpr double kMaxStride = 1e15;  // well within uint64, ~none recorded
+        if (inv > kMaxStride) inv = kMaxStride;
+        uint64_t stride = static_cast<uint64_t>(inv);
+        if (stride < 1) stride = 1;
+        _sample_stride = stride;
+        _effective_sample_rate = 1.0 / static_cast<double>(stride);
+    }
 }
+
+// Recorded-call count that triggers a volume-based aggregate flush, so
+// function-heavy or capture-free workloads still ship stats without waiting for
+// an explicit Flush().
+static constexpr uint64_t kAggFlushThreshold = 256;
 
 void PostHogTelemetry::RecordFunctionCall(const std::string& function_name,
                                           double duration_ms)
@@ -679,29 +741,43 @@ void PostHogTelemetry::RecordFunctionCall(const std::string& function_name,
         return;
     }
 
-    std::lock_guard<std::mutex> lock(_agg_lock);
+    bool flush_now = false;
+    {
+        std::lock_guard<std::mutex> lock(_agg_lock);
 
-    // Client-side decimation: record 1 of every `stride` calls when sampling.
-    if (_sampling_rate < 1.0) {
-        if (_sampling_rate <= 0.0) {
-            return;
+        // Per-function decimation counter that PERSISTS across flushes (a
+        // separate map from the drained stats), so decimation stays accurate
+        // and doesn't reset every flush; per function keeps it unbiased across
+        // interleaved functions.
+        uint64_t seen = ++_sample_seen[function_name];
+
+        if (_sample_stride != 1) {
+            if (_sample_stride == 0) {
+                return;  // rate 0 => record nothing (and DON'T create a stat entry)
+            }
+            if ((seen - 1) % _sample_stride != 0) {
+                return;
+            }
         }
-        uint64_t stride = static_cast<uint64_t>(1.0 / _sampling_rate + 0.5);
-        if (stride < 1) stride = 1;
-        bool record = (_sample_counter % stride) == 0;
-        _sample_counter++;
-        if (!record) {
-            return;
+
+        // Only create/touch the stat entry when the call is actually recorded,
+        // so dropped calls never leave count==0 entries in the aggregator.
+        static constexpr size_t kMaxDurationSamples = 256;
+        auto& st = _function_stats[function_name];
+        st.count++;
+        if (st.duration_samples.size() < kMaxDurationSamples) {
+            st.duration_samples.push_back(duration_ms);
+        } else {
+            st.duration_samples[st.count % kMaxDurationSamples] = duration_ms;
+        }
+
+        if (++_recorded_since_flush >= kAggFlushThreshold) {
+            flush_now = true;
         }
     }
 
-    static constexpr size_t kMaxDurationSamples = 256;
-    auto& st = _function_stats[function_name];
-    st.count++;
-    if (st.duration_samples.size() < kMaxDurationSamples) {
-        st.duration_samples.push_back(duration_ms);
-    } else {
-        st.duration_samples[st.count % kMaxDurationSamples] = duration_ms;
+    if (flush_now && _auto_flush.load()) {
+        FlushFunctionAggregates();  // outside _agg_lock (it re-locks)
     }
 }
 
@@ -722,30 +798,52 @@ std::vector<PostHogEvent> PostHogTelemetry::BuildFunctionAggregateEvents()
     {
         std::lock_guard<std::mutex> lock(_agg_lock);
         snapshot.swap(_function_stats);
-        sample_rate = _sampling_rate;
+        _recorded_since_flush = 0;
+        sample_rate = _effective_sample_rate;  // 1/stride, not the requested rate
     }
 
     std::string distinct = GetDistinctId();
+    std::string extension_name = GetExtensionName();  // continuity dimension
     std::vector<PostHogEvent> events;
-    events.reserve(snapshot.size() * 2);
+    events.reserve(snapshot.size());
     for (auto& kv : snapshot) {
         PropertyMap props;
         props["function_name"]   = kv.first;
         props["call_count"]      = static_cast<int64_t>(kv.second.count);
         props["duration_ms_p50"] = MedianOf(kv.second.duration_samples);
+        if (!extension_name.empty()) {
+            props["extension_name"] = extension_name;
+        }
         if (sample_rate < 1.0) {
             props["sample_rate"] = sample_rate;
         }
-        events.push_back(PostHogEvent{"function_executed", distinct, props});         // new
-        events.push_back(PostHogEvent{"function_execution", distinct, std::move(props)}); // legacy dual-emit
+        // Only the new `function_executed` name. We deliberately do NOT dual-emit
+        // the legacy `function_execution`: aggregation changes its shape from
+        // per-call to per-function-count, so reusing the old name would silently
+        // corrupt count-based dashboards (worse than a clean rename).
+        events.push_back(PostHogEvent{"function_executed", distinct, std::move(props), ""});
     }
     return events;
 }
 
+bool PostHogTelemetry::BufferFunctionAggregates()
+{
+    auto events = BuildFunctionAggregateEvents();
+    if (events.empty()) {
+        return false;
+    }
+    for (auto& ev : events) {
+        BufferEvent(EnrichEvent(ev));
+    }
+    return true;
+}
+
 void PostHogTelemetry::FlushFunctionAggregates()
 {
-    for (auto& ev : BuildFunctionAggregateEvents()) {
-        EnqueueTelemetryEvent(ev);
+    // Buffer all aggregated events, then flush once so a session's function
+    // stats coalesce into a single /batch/ POST instead of one POST per event.
+    if (BufferFunctionAggregates()) {
+        FlushBatch();
     }
 }
 
@@ -798,17 +896,26 @@ void PostHogTelemetry::SetTransportForTesting(
     _transport = std::move(fn);
 }
 
+void PostHogTelemetry::SetAutoFlushEnabledForTesting(bool enabled)
+{
+    _auto_flush.store(enabled);
+}
+
 void PostHogTelemetry::Flush()
 {
-    // Drain the function aggregator into the pending buffer, coalesce the
-    // buffer into one send task, then block (bounded) until the queue drains.
-    FlushFunctionAggregates();
+    // Drain the aggregator into the buffer, then coalesce EVERYTHING (aggregates
+    // + any buffered events) into ONE send task before draining. Enqueuing a
+    // single task means a slow in-flight POST can't strand a second queued task
+    // that at-exit Shutdown would then discard.
+    BufferFunctionAggregates();
     FlushBatch();
 
-    TelemetryTaskQueue<std::vector<PostHogEvent>>* q = nullptr;
+    // Hold a shared_ptr copy so the queue can't be destroyed by a concurrent
+    // Shutdown() while we block in DrainFor (avoids a use-after-free).
+    std::shared_ptr<TelemetryTaskQueue<std::vector<PostHogEvent>>> q;
     {
         std::lock_guard<std::mutex> t(_thread_lock);
-        q = _queue.get();
+        q = _queue;
     }
     if (q) {
         q->DrainFor(3000);

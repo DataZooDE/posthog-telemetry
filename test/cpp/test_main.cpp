@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <iostream>
 #include "catch.hpp"
+#include "telemetry.hpp"
 
 int main(int argc, char *argv[]) {
     // Ensure tests never send data to PostHog
@@ -10,6 +11,11 @@ int main(int argc, char *argv[]) {
 #else
     setenv("DATAZOO_DISABLE_TELEMETRY", "1", 1);
 #endif
+
+    // Disable automatic per-event/threshold flushing so batching and
+    // aggregation are driven deterministically by explicit Flush()/Drain in the
+    // tests. The dedicated auto-flush test re-enables it locally.
+    duckdb::PostHogTelemetry::Instance().SetAutoFlushEnabledForTesting(false);
 
     std::cout << std::endl << "**** PostHog Telemetry Unit Tests ****" << std::endl << std::endl;
 
