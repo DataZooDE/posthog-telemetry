@@ -719,6 +719,28 @@ void PostHogTelemetry::CaptureError(const std::string& error_class, PropertyMap 
     // error_class must be an enumerated class, never a free-form message; the
     // length clamp is a backstop but callers are responsible for the contract.
     props["error_class"] = error_class;
+
+    // PostHog's error-tracking ingestion requires $exception_list on every
+    // $exception event; without it the pipeline rejects the event (stamping
+    // $cymbal_errors) and no Error Tracking issue is ever created. A minimal
+    // {type, value} entry is enough to form issues — no stack trace is
+    // captured by design. emplace: a caller-supplied richer list wins.
+    props.emplace("$exception_list",
+                  PropertyValue::Json("[{\"type\":" + EscapeJsonString(error_class) +
+                                      ",\"value\":" + EscapeJsonString(error_class) + "}]"));
+
+    // Scope issue grouping per product: with identical type/value, PostHog
+    // would otherwise merge e.g. erpl's and flapi's auth_error into one
+    // cross-product issue.
+    std::string product;
+    {
+        std::lock_guard<std::mutex> t(_thread_lock);
+        product = _product.empty() ? _extension_name : _product;
+    }
+    if (!product.empty()) {
+        props.emplace("$exception_fingerprint", product + "/" + error_class);
+    }
+
     Capture("$exception", std::move(props));
 }
 

@@ -195,7 +195,7 @@ Event-specific properties and the full catalogue are documented in
 | `extension_loaded` (+ legacy `extension_load`) | `extension_name`, `extension_version`, `extension_platform` |
 | `feature_used` | `feature`, `feature_detail`, `duration_ms` |
 | `function_executed` (aggregated; legacy `function_execution` retired) | `function_name`, `call_count`, `duration_ms_p50`, `extension_name`, `sample_rate?` |
-| `$exception` | `error_class` (enum), `feature`, `phase` |
+| `$exception` | `error_class` (enum), `feature`, `phase`, auto `$exception_list` + `$exception_fingerprint` (Error Tracking issue creation/grouping) |
 | `$groupidentify` | `$group_type`, `$group_key`, `$group_set` |
 
 ## License

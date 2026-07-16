@@ -425,6 +425,7 @@ TEST_CASE("Capture - feature_used and $exception shapes", "[capture]") {
     t.Flush();
     { std::lock_guard<std::mutex> lk(m); captured.clear(); }
 
+    t.SetProduct("testprod", "1.0.0");
     t.CaptureFeature("sap_rfc", {{"duration_ms", 12.0}});
     t.CaptureError("connection_timeout", {{"phase", "connect"}});
     t.Flush();
@@ -439,10 +440,56 @@ TEST_CASE("Capture - feature_used and $exception shapes", "[capture]") {
             e.properties.count("error_class") &&
             e.properties.at("error_class").s == "connection_timeout") {
             err_ok = true;
+            // Error Tracking ingestion contract: $exception_list must be a
+            // JSON array (not a quoted string) with type/value, and the
+            // fingerprint is product-scoped.
+            REQUIRE(e.properties.count("$exception_list") == 1);
+            const auto& list = e.properties.at("$exception_list");
+            REQUIRE(list.kind == PropertyValue::Kind::Json);
+            REQUIRE(list.s ==
+                    "[{\"type\":\"connection_timeout\",\"value\":\"connection_timeout\"}]");
+            REQUIRE(e.properties.count("$exception_fingerprint") == 1);
+            REQUIRE(e.properties.at("$exception_fingerprint").s ==
+                    "testprod/connection_timeout");
         }
     }
     REQUIRE(feature_ok);
     REQUIRE(err_ok);
+
+    t.SetProduct("", "", "");
+    t.SetTransportForTesting({});
+}
+
+TEST_CASE("CaptureError - caller-supplied $exception_list/fingerprint win", "[capture]") {
+    auto& t = PostHogTelemetry::Instance();
+    t.SetEnabled(true);
+
+    std::vector<PostHogEvent> captured;
+    std::mutex m;
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            std::lock_guard<std::mutex> lk(m);
+            for (auto& e : evs) captured.push_back(e);
+        });
+
+    t.Flush();
+    { std::lock_guard<std::mutex> lk(m); captured.clear(); }
+
+    t.CaptureError("io_error",
+                   {{"$exception_list",
+                     PropertyValue::Json("[{\"type\":\"io_error\",\"value\":\"disk full\"}]")},
+                    {"$exception_fingerprint", "custom-fp"}});
+    t.Flush();
+
+    bool found = false;
+    for (auto& e : captured) {
+        if (e.event_name != "$exception") continue;
+        found = true;
+        REQUIRE(e.properties.at("$exception_list").s ==
+                "[{\"type\":\"io_error\",\"value\":\"disk full\"}]");
+        REQUIRE(e.properties.at("$exception_fingerprint").s == "custom-fp");
+    }
+    REQUIRE(found);
 
     t.SetTransportForTesting({});
 }
