@@ -81,7 +81,7 @@ break it down.
 | `server_started` | server boot (flapi) | `endpoint_count`, `auth_kind` |
 | `feature_used` | a *named* capability is exercised | `feature` (enum), `feature_detail` (bounded), `duration_ms` |
 | `function_executed` | DuckDB function runs (**aggregated**) | `function_name`, `call_count`, `duration_ms_p50`, `sample_rate?` |
-| `$exception` | a caught error | `error_class` (enum, **never** message/data), `feature`, `phase` |
+| `$exception` | a caught error | `error_class` (enum, **never** message/data), `feature`, `phase`, `$exception_list` (auto: `[{type, value}]` = `error_class`; required by PostHog Error Tracking to create issues), `$exception_fingerprint` (auto: `<product>/<error_class>`, keeps issues per-product) |
 
 The legacy `extension_load` name is **dual-emitted for one release**
 (`telemetry_schema: 2`, same shape) so existing dashboards don't go dark, then

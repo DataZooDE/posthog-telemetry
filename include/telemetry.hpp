@@ -247,6 +247,10 @@ public:
     void CaptureFeature(const std::string& feature, PropertyMap props = {});
     // Emits `$exception` with an enumerated `error_class`. Pass ONLY a class
     // from a caller-controlled enum — never a free-form message or user data.
+    // Also stamps the minimal `$exception_list` ({type, value} = error_class)
+    // PostHog Error Tracking needs to create issues, and a product-scoped
+    // `$exception_fingerprint` so issues don't merge across products. Both are
+    // emplace'd: caller-supplied values win.
     void CaptureError(const std::string& error_class, PropertyMap props = {});
 
     // Associate this run with a group (e.g. type="deployment"/"account",
