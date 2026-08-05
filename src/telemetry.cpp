@@ -106,11 +106,24 @@ static std::string ComputeArch()
 }
 
 // True when a well-known CI environment variable is present and truthy.
+//
+// `LINUX_CI_IN_DOCKER` is not a general convention -- it is duckdb/extension-ci-tools'
+// own marker -- and it is here because without it a DuckDB extension's Linux CI is
+// invisible. Those jobs build and test inside a container that receives only an
+// explicit env file, and that file carries none of the eight standard names. So the
+// runs that do most of the testing reported `is_ci: false` and their events were
+// indistinguishable from a customer's. The marker was already being set on every such
+// run; it was simply not being read.
+//
+// It is read as a *value*, like every name here: the same pipeline sets it to `0` on
+// its native (non-container) steps, which reach CI status through `CI` and
+// `GITHUB_ACTIONS` instead.
 static bool ComputeCI()
 {
     static const char* const vars[] = {
         "CI", "GITHUB_ACTIONS", "GITLAB_CI", "BUILDKITE",
-        "JENKINS_URL", "TEAMCITY_VERSION", "TF_BUILD", "CIRCLECI"};
+        "JENKINS_URL", "TEAMCITY_VERSION", "TF_BUILD", "CIRCLECI",
+        "LINUX_CI_IN_DOCKER"};
     for (const char* name : vars) {
         const char* val = std::getenv(name);
         if (val && *val) {
