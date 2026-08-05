@@ -70,6 +70,52 @@ TEST_CASE("Envelope - telemetry_schema is the unquoted number 2", "[envelope]") 
     REQUIRE_FALSE(Contains(json, "\"telemetry_schema\": \"2\""));
 }
 
+TEST_CASE("Envelope - is_ci is true inside a DuckDB extension CI container",
+          "[envelope][is_ci]") {
+    // The case that made this necessary.
+    //
+    // duckdb/extension-ci-tools builds its Linux extension jobs inside a container
+    // and passes it an explicit env file. That file carries none of the eight
+    // well-known CI names -- not `CI`, not `GITHUB_ACTIONS` -- so a container that is
+    // unambiguously running in CI reported `is_ci: false`, and its events were
+    // indistinguishable from a customer's. It does set `LINUX_CI_IN_DOCKER=1`, on
+    // every such run, which is the signal that was there all along and unread.
+    //
+    // The variable is set to `0` for the same pipeline's *native* steps, so it has to
+    // be read as a value rather than as mere presence -- which `ComputeCI` already
+    // does for every name it knows.
+    auto& t = PostHogTelemetry::Instance();
+
+    const char* const ci_vars[] = {"GITHUB_ACTIONS", "CI", "GITLAB_CI", "BUILDKITE",
+                                    "JENKINS_URL", "TEAMCITY_VERSION", "TF_BUILD",
+                                    "CIRCLECI", "LINUX_CI_IN_DOCKER"};
+    std::map<std::string, std::string> saved;
+    std::vector<std::string> was_unset;
+    for (const char* v : ci_vars) {
+        if (const char* cur = std::getenv(v)) saved[v] = cur;
+        else was_unset.push_back(v);
+    }
+
+    // Exactly the container's environment: the docker env file and nothing else.
+    for (const char* v : ci_vars) UnsetEnv(v);
+    SetEnv("LINUX_CI_IN_DOCKER", "1");
+    PostHogTelemetry::ResetDetectionCacheForTesting();
+    std::string json_docker = t.BuildEventForTesting("extension_loaded", {}).GetPropertiesJson();
+    REQUIRE(Contains(json_docker, "\"is_ci\": true"));
+
+    // And the native steps of the same pipeline, which set it to 0 and rely on the
+    // ordinary names. With those cleared too, nothing claims CI.
+    for (const char* v : ci_vars) UnsetEnv(v);
+    SetEnv("LINUX_CI_IN_DOCKER", "0");
+    PostHogTelemetry::ResetDetectionCacheForTesting();
+    std::string json_native = t.BuildEventForTesting("extension_loaded", {}).GetPropertiesJson();
+    REQUIRE(Contains(json_native, "\"is_ci\": false"));
+
+    for (auto& kv : saved) SetEnv(kv.first.c_str(), kv.second.c_str());
+    for (auto& v : was_unset) UnsetEnv(v.c_str());
+    PostHogTelemetry::ResetDetectionCacheForTesting();
+}
+
 TEST_CASE("Envelope - is_ci is true under faked GITHUB_ACTIONS", "[envelope][is_ci]") {
     auto& t = PostHogTelemetry::Instance();
 
