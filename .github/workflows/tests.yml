@@ -9,9 +9,14 @@ on:
 env:
   DATAZOO_DISABLE_TELEMETRY: "1"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   test:
     name: Run Tests (${{ matrix.os }})
+    timeout-minutes: 35
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
