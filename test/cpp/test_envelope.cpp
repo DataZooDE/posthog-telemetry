@@ -149,6 +149,156 @@ TEST_CASE("Envelope - is_ci is true under faked GITHUB_ACTIONS", "[envelope][is_
     PostHogTelemetry::ResetDetectionCacheForTesting();
 }
 
+namespace {
+
+// Saves every CI-related variable (detection names + the opt-in) on entry and
+// restores them, plus the detection cache, on exit.
+struct CIEnvGuard {
+    std::map<std::string, std::string> saved;
+    std::vector<std::string> was_unset;
+    static const std::vector<const char*>& Names() {
+        static const std::vector<const char*> names = {
+            "GITHUB_ACTIONS", "CI", "GITLAB_CI", "BUILDKITE", "JENKINS_URL",
+            "TEAMCITY_VERSION", "TF_BUILD", "CIRCLECI", "LINUX_CI_IN_DOCKER",
+            "DATAZOO_TELEMETRY_IN_CI"};
+        return names;
+    }
+    CIEnvGuard() {
+        for (const char* v : Names()) {
+            if (const char* cur = std::getenv(v)) saved[v] = cur;
+            else was_unset.push_back(v);
+        }
+    }
+    void ClearAll() {
+        for (const char* v : Names()) UnsetEnv(v);
+    }
+    ~CIEnvGuard() {
+        for (auto& kv : saved) SetEnv(kv.first.c_str(), kv.second.c_str());
+        for (auto& v : was_unset) UnsetEnv(v.c_str());
+        PostHogTelemetry::ResetDetectionCacheForTesting();
+    }
+};
+
+} // namespace
+
+TEST_CASE("CI - detected CI without opt-in captures, queues and sends nothing",
+          "[ci][capture]") {
+    auto& t = PostHogTelemetry::Instance();
+    CIEnvGuard guard;
+
+    std::atomic<int> sent{0};
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            sent += static_cast<int>(evs.size());
+        });
+    t.SetEnabled(true);
+    t.Flush();   // drain leftovers from earlier tests with CI-mode off
+    sent = 0;
+
+    for (const char* ci_var : {"CI", "GITHUB_ACTIONS", "LINUX_CI_IN_DOCKER"}) {
+        INFO("CI variable: " << ci_var);
+        guard.ClearAll();
+        SetEnv(ci_var, "true");
+        PostHogTelemetry::ResetDetectionCacheForTesting();
+        REQUIRE(PostHogTelemetry::SuppressedInCI());
+
+        t.CaptureExtensionLoad("ci_ext", "1.0.0");
+        t.CaptureFeature("ci_feature", {});
+        t.CaptureError("ci_error", {});
+        t.AssociateGroup("org", "ci_org");
+        t.RecordFunctionCall("ci_fn", 1.0);
+        // Nothing reached the aggregator either.
+        REQUIRE(t.DrainFunctionAggregatesForTesting().empty());
+        t.Flush();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        REQUIRE(sent == 0);
+    }
+
+    // Leaving CI-mode afterwards must not resurrect anything captured during it.
+    guard.ClearAll();
+    PostHogTelemetry::ResetDetectionCacheForTesting();
+    REQUIRE_FALSE(PostHogTelemetry::SuppressedInCI());
+    t.Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    REQUIRE(sent == 0);
+
+    t.SetTransportForTesting({});
+}
+
+TEST_CASE("CI - DATAZOO_TELEMETRY_IN_CI opts back in, events tagged is_ci",
+          "[ci][capture]") {
+    auto& t = PostHogTelemetry::Instance();
+    CIEnvGuard guard;
+
+    std::vector<PostHogEvent> got;
+    std::mutex got_lock;
+    t.SetTransportForTesting(
+        [&](const std::string&, const std::string&, const std::vector<PostHogEvent>& evs) {
+            std::lock_guard<std::mutex> l(got_lock);
+            got.insert(got.end(), evs.begin(), evs.end());
+        });
+    t.SetEnabled(true);
+    t.Flush();
+
+    for (const char* optin : {"1", "true", "yes"}) {
+        INFO("DATAZOO_TELEMETRY_IN_CI=" << optin);
+        guard.ClearAll();
+        SetEnv("GITHUB_ACTIONS", "true");
+        SetEnv("DATAZOO_TELEMETRY_IN_CI", optin);
+        PostHogTelemetry::ResetDetectionCacheForTesting();
+        REQUIRE_FALSE(PostHogTelemetry::SuppressedInCI());
+
+        {
+            std::lock_guard<std::mutex> l(got_lock);
+            got.clear();
+        }
+        t.CaptureFeature("ci_optin_feature", {});
+        t.Flush();
+        std::lock_guard<std::mutex> l(got_lock);
+        REQUIRE(got.size() == 1);
+        REQUIRE(got[0].event_name == "feature_used");
+        REQUIRE(Contains(got[0].GetPropertiesJson(), "\"is_ci\": true"));
+    }
+
+    // Any other value is not an opt-in.
+    for (const char* not_optin : {"0", "false", "no", "maybe"}) {
+        INFO("DATAZOO_TELEMETRY_IN_CI=" << not_optin);
+        guard.ClearAll();
+        SetEnv("CI", "true");
+        SetEnv("DATAZOO_TELEMETRY_IN_CI", not_optin);
+        PostHogTelemetry::ResetDetectionCacheForTesting();
+        REQUIRE(PostHogTelemetry::SuppressedInCI());
+    }
+
+    // The opt-in is irrelevant outside CI.
+    guard.ClearAll();
+    PostHogTelemetry::ResetDetectionCacheForTesting();
+    REQUIRE_FALSE(PostHogTelemetry::SuppressedInCI());
+
+    t.SetTransportForTesting({});
+}
+
+TEST_CASE("CI - DATAZOO_DISABLE_TELEMETRY still wins over the CI opt-in",
+          "[ci][optout]") {
+    // The real transport is the enforcement point for the env opt-out. With the
+    // opt-in set the CI gate is open, so this exercises the disable var alone:
+    // PostHogProcessBatch must return without touching the network. (The suite
+    // runs with DATAZOO_DISABLE_TELEMETRY=1; a pointless host proves no I/O.)
+    CIEnvGuard guard;
+    guard.ClearAll();
+    SetEnv("CI", "true");
+    SetEnv("DATAZOO_TELEMETRY_IN_CI", "1");
+    PostHogTelemetry::ResetDetectionCacheForTesting();
+    REQUIRE(std::getenv("DATAZOO_DISABLE_TELEMETRY") != nullptr);
+
+    PostHogEvent ev{"feature_used", "id", {}, ""};
+    auto start = std::chrono::steady_clock::now();
+    PostHogProcessBatch("key", "https://10.255.255.1", {ev});   // unroutable
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start).count();
+    REQUIRE(ms < 1000);   // returned immediately, no 3 s connect timeout
+}
+
 TEST_CASE("Envelope - product falls back to extension name", "[envelope]") {
     auto& t = PostHogTelemetry::Instance();
     t.SetExtensionName("erpl");

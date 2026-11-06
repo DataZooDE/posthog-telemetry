@@ -32,7 +32,7 @@ pass event-specific properties.
 | `os` | string | `linux` \| `macos` \| `windows` |
 | `arch` | string | `amd64` \| `arm64` |
 | `platform` | string | e.g. `linux_amd64` (kept for continuity) |
-| `is_ci` | **bool** | true under `CI`/`GITHUB_ACTIONS`/`GITLAB_CI`/`BUILDKITE`/`JENKINS_URL`/`TEAMCITY_VERSION`/`TF_BUILD`/`CIRCLECI` |
+| `is_ci` | **bool** | true under `CI`/`GITHUB_ACTIONS`/`GITLAB_CI`/`BUILDKITE`/`JENKINS_URL`/`TEAMCITY_VERSION`/`TF_BUILD`/`CIRCLECI`/`LINUX_CI_IN_DOCKER`. Only ever `true` when CI telemetry was opted into with `DATAZOO_TELEMETRY_IN_CI=1` (by default CI sends no events, see §5) |
 | `is_container` | **bool** | true under `/.dockerenv` or a container cgroup |
 | `$session_id` | string | one UUID per process/run (enables Paths) |
 | `$groups` | object | e.g. `{ "deployment": "<hash>" }`, present once a group is associated |
@@ -160,9 +160,13 @@ call `AssociateGroup("account", sha256(license_id), {edition, first_seen_version
 - **EU cloud ingestion** (`eu.i.posthog.com`); anonymous-by-default pseudonymous
   per-machine `distinct_id` (salted so it can't be trivially reproduced from the
   raw machine id by another dataset).
+- **No telemetry from CI**: when a CI environment is detected (any `is_ci`
+  variable, see §2) nothing is captured, queued or sent. A project can opt in
+  with `DATAZOO_TELEMETRY_IN_CI=1|true|yes`; those events are tagged
+  `is_ci: true`. `DATAZOO_DISABLE_TELEMETRY` wins over the opt-in.
 - **No Person for ephemeral/CI**: events with no stable hardware identity or from
-  CI carry `$process_person_profile: false`, so they never create Person profiles
-  (privacy + avoids Person-DB bloat).
+  (opted-in) CI carry `$process_person_profile: false`, so they never create
+  Person profiles (privacy + avoids Person-DB bloat).
 - **Bounded, enumerated properties only** (§3) — the technical guarantee no
   query text, hostnames, or user data ever leave the machine.
 - **Opt-out**, honoured everywhere and enforced at the transport (nothing
