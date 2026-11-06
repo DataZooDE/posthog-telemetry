@@ -318,8 +318,13 @@ public:
     // can assert exact aggregate counts).
     void SetPromptFunctionCallsForTesting(int n);
 
-    // Testing seam: clear the cached is_ci detection so a test can re-fake the
-    // environment (CI status is cached once in production).
+    // True when a CI environment is detected and DATAZOO_TELEMETRY_IN_CI is not
+    // set to 1/true/yes. In that state nothing is captured, queued or sent.
+    // Both env lookups are cached once per process (no getenv per event).
+    static bool SuppressedInCI();
+
+    // Testing seam: clear the cached is_ci / CI opt-in detection so a test can
+    // re-fake the environment (both are cached once in production).
     static void ResetDetectionCacheForTesting();
 
     // Testing seam: undo a Cleanup()/Shutdown() so the shared singleton is
@@ -394,6 +399,7 @@ private:
     PropertyMap BuildEnvelope() const;
 
     static bool DetectCI();
+    static bool DetectCIOptIn();
     static bool DetectContainer();
     static const std::string& DetectOs();
     static const std::string& DetectArch();
@@ -540,6 +546,7 @@ public:
     static std::string GetIdentitySource() { return ""; }
     static std::string GetMachineId() { return ""; }
     static std::string GetSessionId() { return ""; }
+    static bool SuppressedInCI() { return true; }
 
 private:
     PostHogTelemetry() = default;

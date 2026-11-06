@@ -136,6 +136,23 @@ static bool ComputeCI()
     return false;
 }
 
+// True when the CI opt-in `DATAZOO_TELEMETRY_IN_CI` is set to 1/true/yes.
+//
+// By default a detected CI environment sends nothing at all (see
+// PostHogTelemetry::SuppressedInCI): CI runs are not product usage, and tagging
+// them `is_ci: true` still shipped every test-suite event. A project that does
+// want CI events (e.g. to verify its own telemetry wiring) opts in with this
+// variable, and gets the previous behaviour: events are sent, tagged `is_ci`.
+static bool ComputeCIOptIn()
+{
+    const char* val = std::getenv("DATAZOO_TELEMETRY_IN_CI");
+    if (!val) {
+        return false;
+    }
+    std::string v(val);
+    return v == "1" || v == "true" || v == "yes";
+}
+
 // True when running inside a container. Cheap file probes; cached once since a
 // process cannot migrate in or out of a container.
 static bool ComputeContainer()
@@ -310,6 +327,11 @@ static const char* const kDefaultHost = "https://eu.i.posthog.com";
 
 static bool TelemetryDisabledByEnv()
 {
+    // Detected CI without the explicit opt-in: nothing leaves the machine.
+    // Checked first because it is a cached lookup (no getenv per batch).
+    if (PostHogTelemetry::SuppressedInCI()) {
+        return true;
+    }
     const char* disable_telemetry = std::getenv("DATAZOO_DISABLE_TELEMETRY");
     return disable_telemetry && (std::string(disable_telemetry) == "1" ||
                                  std::string(disable_telemetry) == "true" ||
@@ -427,6 +449,9 @@ void PostHogTelemetry::Shutdown()
 // after a runtime opt-out.
 bool PostHogTelemetry::CanAcceptTelemetry()
 {
+    if (SuppressedInCI()) {
+        return false;
+    }
     std::lock_guard<std::mutex> t(_thread_lock);
     return !_shutdown_requested && _telemetry_enabled;
 }
@@ -434,6 +459,11 @@ bool PostHogTelemetry::CanAcceptTelemetry()
 PostHogTelemetry& PostHogTelemetry::Instance()
 {
     static PostHogTelemetry* instance = []() {
+        // Prime the cached environment lookups (CI detection + CI opt-in) once,
+        // at first use -- normally extension load, before the host has spawned
+        // query threads -- so later events never call std::getenv concurrently
+        // with a host setenv/putenv.
+        (void)SuppressedInCI();
         OPENSSL_init_ssl(0, nullptr);
         // Construct (and discard) a client once so httplib's function-local
         // statics — notably the URL-parsing regex in the Client constructor —
@@ -485,6 +515,9 @@ static constexpr size_t kMaxPendingEvents = 10000;
 
 void PostHogTelemetry::BufferEvent(const PostHogEvent &enriched)
 {
+    if (SuppressedInCI()) {
+        return;  // detected CI, no opt-in: never queue anything
+    }
     {
         std::lock_guard<std::mutex> t(_thread_lock);
         if (_shutdown_requested || !_telemetry_enabled) {
@@ -532,7 +565,7 @@ void PostHogTelemetry::ScheduleSend()
         _flush_scheduled = true;
     }
     std::lock_guard<std::mutex> t(_thread_lock);
-    if (_shutdown_requested || !_telemetry_enabled) {
+    if (_shutdown_requested || !_telemetry_enabled || SuppressedInCI()) {
         std::lock_guard<std::mutex> b(_batch_lock);
         _flush_scheduled = false;   // won't run; let a later attempt reschedule
         return;
@@ -561,8 +594,8 @@ void PostHogTelemetry::DrainAndSend()
                        const std::vector<PostHogEvent>&)> transport;
     {
         std::lock_guard<std::mutex> t(_thread_lock);
-        if (_shutdown_requested || !_telemetry_enabled) {
-            return;  // opted out / tearing down: discard the swapped batch
+        if (_shutdown_requested || !_telemetry_enabled || SuppressedInCI()) {
+            return;  // opted out / tearing down / CI: discard the swapped batch
         }
         api_key   = _api_key;
         host      = _host.empty() ? kDefaultHost : _host;
@@ -580,6 +613,8 @@ void PostHogTelemetry::DrainAndSend()
 // calling std::getenv on every event, which is a data race against a concurrent
 // std::setenv/putenv in the host. Tests reset the cache to fake the environment.
 static std::atomic<int> g_ci_cache{-1};  // -1 = uncomputed, 0/1 = value
+// Same pattern for the DATAZOO_TELEMETRY_IN_CI opt-in.
+static std::atomic<int> g_ci_optin_cache{-1};
 
 bool PostHogTelemetry::DetectCI()
 {
@@ -591,9 +626,25 @@ bool PostHogTelemetry::DetectCI()
     return c != 0;
 }
 
+bool PostHogTelemetry::DetectCIOptIn()
+{
+    int c = g_ci_optin_cache.load();
+    if (c < 0) {
+        c = ComputeCIOptIn() ? 1 : 0;
+        g_ci_optin_cache.store(c);
+    }
+    return c != 0;
+}
+
+bool PostHogTelemetry::SuppressedInCI()
+{
+    return DetectCI() && !DetectCIOptIn();
+}
+
 void PostHogTelemetry::ResetDetectionCacheForTesting()
 {
     g_ci_cache.store(-1);
+    g_ci_optin_cache.store(-1);
 }
 
 bool PostHogTelemetry::DetectContainer()
@@ -714,7 +765,7 @@ void PostHogTelemetry::Capture(const std::string& event, PropertyMap props)
     // wrappers route through here. The DATAZOO_DISABLE_TELEMETRY opt-out is
     // enforced at the transport (PostHogProcessBatch) so it is a hard
     // "nothing leaves the machine" guarantee regardless of this path.
-    if (!_telemetry_enabled) {
+    if (!_telemetry_enabled || SuppressedInCI()) {
         return;
     }
     PostHogEvent ev = { event, GetDistinctId(), std::move(props), "" };
@@ -776,7 +827,7 @@ void PostHogTelemetry::AssociateGroup(const std::string& type,
     // Only mark the group identified when we can actually emit the
     // $groupidentify; otherwise a disabled-at-associate-time group would be
     // permanently suppressed and never re-identified once telemetry is enabled.
-    if (!_telemetry_enabled) {
+    if (!_telemetry_enabled || SuppressedInCI()) {
         return;
     }
 
@@ -908,7 +959,7 @@ static constexpr size_t kMaxTrackedFunctions = 10000;
 void PostHogTelemetry::RecordFunctionCall(const std::string& function_name,
                                           double duration_ms)
 {
-    if (!_telemetry_enabled) {
+    if (!_telemetry_enabled || SuppressedInCI()) {
         return;
     }
 

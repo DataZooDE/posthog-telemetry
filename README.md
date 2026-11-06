@@ -18,6 +18,8 @@ A reusable C++ library for integrating PostHog telemetry into DuckDB extensions.
   stable hardware id exists, tagged `identity_source` + `$process_person_profile`.
 - **Enabled by default**, with user opt-out via DuckDB settings or environment
   variable, enforced at the transport (nothing leaves the machine when disabled).
+- **Silent in CI**: when a CI environment is detected nothing is captured, queued
+  or sent, unless the project opts in with `DATAZOO_TELEMETRY_IN_CI=1`.
 - Buffered events auto-send on a background interval (and at a size threshold);
   `Flush()` forces a synchronous drain for short-lived processes; the at-exit
   *discard* stays the safety net.
@@ -166,6 +168,27 @@ export DATAZOO_DISABLE_TELEMETRY=1
 # or
 export DATAZOO_DISABLE_TELEMETRY=true
 ```
+
+`DATAZOO_DISABLE_TELEMETRY` always wins, including over the CI opt-in below.
+
+### CI environments (off by default)
+
+When any of `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`, `JENKINS_URL`, `TEAMCITY_VERSION`, `TF_BUILD`, `CIRCLECI`, `LINUX_CI_IN_DOCKER` is set to a value other than empty, `0` or `false`, the
+library sends **nothing**: no events are captured, queued or posted. CI runs are
+not product usage, so they are dropped at the source rather than tagged and
+filtered later.
+
+To send events from CI anyway (for example to verify your own telemetry
+wiring), opt in:
+
+```bash
+export DATAZOO_TELEMETRY_IN_CI=1   # or true / yes
+```
+
+Opted-in CI events behave as before: they are tagged `is_ci: true` and carry
+`$process_person_profile: false`. Both variables are read once per process and
+cached (no `getenv` per event), so set them before the extension loads.
+`PostHogTelemetry::SuppressedInCI()` reports the current state.
 
 ### DuckDB Setting
 

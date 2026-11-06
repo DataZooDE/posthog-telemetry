@@ -20,9 +20,12 @@ one you're configuring, and that it's the **EU** cloud project.
 ## 2. Exclude CI / bot noise (highest value)
 
 Every CI run that loads an extension would otherwise look like a real user and
-make DAU fiction. The library already tags those events (`is_ci: true`) and never
-creates a Person for them (`$process_person_profile: false`), but Trends/Funnels
-still count the *events* unless you filter them.
+make DAU fiction. The library now sends **nothing** from a detected CI
+environment unless the project opts in with `DATAZOO_TELEMETRY_IN_CI=1`. Opted-in
+CI events (and events from library versions before this default, which are still
+in the wild) are tagged `is_ci: true` and never create a Person
+(`$process_person_profile: false`), but Trends/Funnels still count the *events*
+unless you filter them, so keep this filter.
 
 - **Settings → Project → "Filter out internal and test users" → Add filter**:
   - event property **`is_ci`** **`= true`**

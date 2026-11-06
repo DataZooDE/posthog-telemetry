@@ -138,6 +138,15 @@ export DATAZOO_DISABLE_TELEMETRY=yes
 
 This environment variable is checked at event send time and will silently skip sending events.
 
+### CI environments
+
+CI is silent by default: when `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`,
+`JENKINS_URL`, `TEAMCITY_VERSION`, `TF_BUILD`, `CIRCLECI` or `LINUX_CI_IN_DOCKER`
+is set (to anything but empty/`0`/`false`), no events are captured, queued or
+sent. Set `DATAZOO_TELEMETRY_IN_CI=1` (or `true`/`yes`) to send from CI anyway;
+those events are tagged `is_ci: true`. `DATAZOO_DISABLE_TELEMETRY` still wins.
+Extension CI does not need to set anything.
+
 ### DuckDB Setting
 
 Telemetry is **enabled by default** to assist with development and usage tracking. However, you **must** provide a way for users to opt-out.
@@ -164,6 +173,7 @@ SET my_extension_telemetry_enabled = false;
     *   Check if `SetAPIKey` was called before `CaptureExtensionLoad`.
     *   Check if the device has network access.
     *   Check if `DATAZOO_DISABLE_TELEMETRY` environment variable is set.
+    *   Check whether a CI variable is set (e.g. `CI=true`): CI sends nothing unless `DATAZOO_TELEMETRY_IN_CI=1`.
     *   Telemetry fails silently to avoid crashing the database; errors are logged to stderr.
 
 ## 9. Example: Complete Integration
