@@ -479,8 +479,33 @@ PostHogTelemetry& PostHogTelemetry::Instance()
     return *instance;
 }
 
+// True while Windows tears the process down (ExitProcess): every other thread
+// has already been terminated and DLLs are being detached. Always false
+// elsewhere.
+static bool ProcessTerminationInProgress()
+{
+#ifdef _WIN32
+    using Fn = BOOLEAN(WINAPI *)();
+    static Fn fn = reinterpret_cast<Fn>(
+        reinterpret_cast<void *>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlDllShutdownInProgress")));
+    return fn && fn();
+#else
+    return false;
+#endif
+}
+
 void PostHogTelemetry::ShutdownAtExit()
 {
+    if (ProcessTerminationInProgress()) {
+        // The atexit handler of a DLL (an extension loaded with LOAD) runs in
+        // DLL_PROCESS_DETACH, after ExitProcess has killed the worker thread.
+        // With winpthreads (MinGW) the killed worker can leave the condition
+        // variable's internal lock taken, so notify, join or destroy it would
+        // block forever and the process never exits. Touch no lock or
+        // condition variable: leak the queue and let the OS reclaim it.
+        new std::shared_ptr<TelemetryTaskQueue<int>>(std::move(Instance()._queue));
+        return;
+    }
     Instance().Shutdown();
 }
 
